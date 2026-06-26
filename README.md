@@ -2,9 +2,9 @@
 
 Widget flottante always-on-top che mostra in tempo reale:
 
-- **Sessione 5h** — % usata + countdown al reset
-- **Settimana** — % usata + countdown al reset  
-- **Sonnet** — solo se incluso nel tuo piano (Max/Team)
+- **Contesto** — solo se in uso claude code (aggiornato ogni minuto)
+- **Sessione 5h** — % usata + countdown al reset (aggiornato ogni 5 minuti)
+- **Settimana** — % usata + countdown al reset  (aggiornato ogni 5 minuti)
 
 Stessi dati di `Impostazioni → Utilizzo` in Claude Desktop.
 
@@ -42,7 +42,7 @@ Non è necessario installare Node.js o utilizzare il terminale per autenticarsi.
 | **Tasto destro** | Menu contestuale: Aggiorna / Impostazioni / Chiudi |
 | **⚙** (in alto a destra) | Apre la finestra delle impostazioni / inserimento chiave |
 
-Il widget si aggiorna automaticamente ogni 5 minuti.
+Il widget si aggiorna automaticamente con tempistiche diverse a seconda della barra.
 
 ---
 
