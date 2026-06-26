@@ -415,6 +415,7 @@ class UsageWidget:
             self._dot.config(fg=C["green"])
             self._status_lbl.config(
                 text=f"Aggiornato {datetime.now().strftime('%H:%M')}")
+            self._position_window()
         self.root.after(0, update)
 
     def show_error(self, msg: str):
