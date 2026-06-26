@@ -26,6 +26,7 @@ import threading
 import json
 import os
 import sys
+import re
 import webbrowser
 import time
 from datetime import datetime, timezone
@@ -46,7 +47,8 @@ ORGS_URL     = "https://claude.ai/api/organizations"
 
 CREDS_FILE   = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
 CFG_FILE     = os.path.join(os.path.expanduser("~"), ".claude_usage_widget.json")
-REFRESH_SEC  = 300
+REFRESH_SEC     = 300
+CTX_REFRESH_SEC = 60
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CTX_MAX_TOKENS  = 200_000
 
@@ -213,7 +215,8 @@ def fetch_context_window() -> dict | None:
             except json.JSONDecodeError:
                 continue
             if obj.get("type") == "assistant":
-                usage = (obj.get("message") or {}).get("usage") or {}
+                msg   = obj.get("message") or {}
+                usage = msg.get("usage") or {}
                 tokens = (
                     int(usage.get("input_tokens") or 0)
                     + int(usage.get("cache_read_input_tokens") or 0)
@@ -226,10 +229,19 @@ def fetch_context_window() -> dict | None:
                     "tokens_used": tokens,
                     "tokens_max":  CTX_MAX_TOKENS,
                     "age_min":     int(age_min),
+                    "model":       _fmt_model(msg.get("model") or ""),
                 }
         return None
     except Exception:
         return None
+
+
+def _fmt_model(model_id: str) -> str:
+    """'claude-sonnet-4-6' → 'Sonnet 4.6',  'claude-haiku-4-5-20251001' → 'Haiku 4.5'"""
+    m = re.match(r"claude-(\w+)-(\d+)-(\d+)", model_id)
+    if m:
+        return f"{m.group(1).capitalize()} {m.group(2)}.{m.group(3)}"
+    return model_id
 
 # ── Utilità UI ────────────────────────────────────────────────────────────────
 
@@ -315,21 +327,23 @@ class UsageWidget:
         self._bar_frame = tk.Frame(outer, bg=C["bg"])
         self._bar_frame.pack(fill=tk.BOTH, expand=True)
 
+        # Barra Contesto: creata per prima così pack(before=) funziona correttamente
+        f, cv, pl, rl, tl = self._make_bar(self._bar_frame, "Contesto", C["purple"])
+        self._bars["context"] = (f, cv, pl, rl)
+        self._ctx_title_lbl = tl
+        f.pack_forget()  # mostrata solo se c'è una sessione attiva
+
         for key, label, color in [
             ("five_hour",        "Sessione  (5h)",  C["blue"]),
             ("seven_day",        "Settimana",        C["green"]),
             ("seven_day_sonnet", "Sonnet",           C["purple"]),
         ]:
-            f, cv, pl, rl = self._make_bar(self._bar_frame, label, color)
+            f, cv, pl, rl, _ = self._make_bar(self._bar_frame, label, color)
             self._bars[key] = (f, cv, pl, rl)
             if key == "seven_day_sonnet":
                 f.pack_forget()
             else:
                 f.pack(fill=tk.X, pady=(0, 5))
-
-        f, cv, pl, rl = self._make_bar(self._bar_frame, "Contesto  (Claude Code)", C["purple"])
-        self._bars["context"] = (f, cv, pl, rl)
-        f.pack_forget()  # mostrata solo se c'è una sessione attiva
 
         # Footer: status a sinistra, credits a destra
         footer_frame = tk.Frame(outer, bg=C["bg"])
@@ -352,8 +366,9 @@ class UsageWidget:
         frame = tk.Frame(parent, bg=C["bg"])
         row   = tk.Frame(frame, bg=C["bg"])
         row.pack(fill=tk.X)
-        tk.Label(row, text=label, font=("Segoe UI", 8, "bold"),
-                  bg=C["bg"], fg="#999", anchor="w").pack(side=tk.LEFT)
+        title_lbl = tk.Label(row, text=label, font=("Segoe UI", 8, "bold"),
+                              bg=C["bg"], fg="#999", anchor="w")
+        title_lbl.pack(side=tk.LEFT)
         pct_lbl = tk.Label(row, text="–%",
                             font=("Segoe UI", 9, "bold"),
                             bg=C["bg"], fg="#ddd")
@@ -366,7 +381,7 @@ class UsageWidget:
                               font=("Segoe UI", 7),
                               bg=C["bg"], fg=C["gray"])
         reset_lbl.pack(anchor=tk.W)
-        return frame, canvas, pct_lbl, reset_lbl
+        return frame, canvas, pct_lbl, reset_lbl, title_lbl
 
     def _draw_bar(self, key, pct, resets_at):
         if key not in self._bars:
@@ -399,19 +414,6 @@ class UsageWidget:
                     self._bars[key][0].pack(fill=tk.X, pady=(0, 5))
                 self._draw_bar(key, pct, rst)
 
-            ctx = fetch_context_window()
-            bar_f, bar_cv, bar_pl, bar_rl = self._bars["context"]
-            if ctx:
-                bar_f.pack(fill=tk.X, pady=(0, 5))
-                self._draw_bar("context", ctx["pct"], "")
-                color = C["red"] if ctx["pct"] > 85 else C["yellow"] if ctx["pct"] > 65 else C["green"]
-                bar_pl.config(text=f"{ctx['pct']:.0f}%", fg=color)
-                bar_rl.config(
-                    text=f"{ctx['tokens_used']:,} / {ctx['tokens_max']:,} tk"
-                         f"  ·  {ctx['age_min']}m fa")
-            else:
-                bar_f.pack_forget()
-
             self._dot.config(fg=C["green"])
             self._status_lbl.config(
                 text=f"Aggiornato {datetime.now().strftime('%H:%M')}")
@@ -424,7 +426,32 @@ class UsageWidget:
             self._status_lbl.config(text=f"⚠ {msg[:40]}"),
         ))
 
-    # ── refresh ───────────────────────────────────────────────────────────────
+    # ── refresh context window ────────────────────────────────────────────────
+
+    def _refresh_context(self):
+        ctx = fetch_context_window()
+        def update():
+            bar_f, bar_cv, bar_pl, bar_rl = self._bars["context"]
+            if ctx:
+                self._ctx_title_lbl.config(
+                    text=f"Contesto  ({ctx['model']})" if ctx["model"] else "Contesto")
+                bar_f.pack(fill=tk.X, pady=(0, 5),
+                           before=self._bars["five_hour"][0])
+                self._draw_bar("context", ctx["pct"], "")
+                color = (C["red"] if ctx["pct"] > 85
+                         else C["yellow"] if ctx["pct"] > 65
+                         else C["green"])
+                bar_pl.config(text=f"{ctx['pct']:.0f}%", fg=color)
+                bar_rl.config(
+                    text=f"{ctx['tokens_used']:,} / {ctx['tokens_max']:,} tk"
+                         f"  ·  {ctx['age_min']}m fa")
+            else:
+                bar_f.pack_forget()
+            self._position_window()
+        self.root.after(0, update)
+        self.root.after(CTX_REFRESH_SEC * 1000, self._refresh_context)
+
+    # ── refresh utilizzo API ──────────────────────────────────────────────────
 
     def _refresh_once(self):
         self.creds = load_credentials()
@@ -449,6 +476,7 @@ class UsageWidget:
             self.root.after(200, self._show_setup)
         else:
             threading.Thread(target=self._refresh_loop, daemon=True).start()
+        self._refresh_context()  # avvia loop autonomo context window (ogni 60s)
 
     # ── drag ──────────────────────────────────────────────────────────────────
 
