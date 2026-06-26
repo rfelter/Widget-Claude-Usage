@@ -29,6 +29,7 @@ import sys
 import webbrowser
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 try:
     import requests
@@ -46,6 +47,8 @@ ORGS_URL     = "https://claude.ai/api/organizations"
 CREDS_FILE   = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
 CFG_FILE     = os.path.join(os.path.expanduser("~"), ".claude_usage_widget.json")
 REFRESH_SEC  = 300
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+CTX_MAX_TOKENS  = 200_000
 
 # ── Tema ──────────────────────────────────────────────────────────────────────
 C = dict(
@@ -184,6 +187,50 @@ def fetch_usage(creds: dict) -> dict:
 
     raise RuntimeError(" | ".join(errs) or "Nessun metodo di autenticazione disponibile")
 
+
+def fetch_context_window() -> dict | None:
+    """
+    Legge il .jsonl più recente in ~/.claude/projects/*/
+    e restituisce {pct, tokens_used, tokens_max, age_min}
+    oppure None se nessuna sessione attiva trovata (>4h).
+    """
+    try:
+        jsonl_files = list(CLAUDE_PROJECTS.glob("*/*.jsonl"))
+        if not jsonl_files:
+            return None
+
+        latest = max(jsonl_files, key=lambda f: f.stat().st_mtime)
+        age_min = (time.time() - latest.stat().st_mtime) / 60
+        if age_min > 240:
+            return None
+
+        lines = latest.read_text(encoding="utf-8", errors="ignore").splitlines()
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "assistant":
+                usage = (obj.get("message") or {}).get("usage") or {}
+                tokens = (
+                    int(usage.get("input_tokens") or 0)
+                    + int(usage.get("cache_read_input_tokens") or 0)
+                    + int(usage.get("cache_creation_input_tokens") or 0)
+                )
+                if tokens == 0:
+                    return None
+                return {
+                    "pct":         min(tokens / CTX_MAX_TOKENS * 100, 100),
+                    "tokens_used": tokens,
+                    "tokens_max":  CTX_MAX_TOKENS,
+                    "age_min":     int(age_min),
+                }
+        return None
+    except Exception:
+        return None
+
 # ── Utilità UI ────────────────────────────────────────────────────────────────
 
 def bar_color(pct: float) -> str:
@@ -280,6 +327,10 @@ class UsageWidget:
             else:
                 f.pack(fill=tk.X, pady=(0, 5))
 
+        f, cv, pl, rl = self._make_bar(self._bar_frame, "Contesto  (Claude Code)", C["purple"])
+        self._bars["context"] = (f, cv, pl, rl)
+        f.pack_forget()  # mostrata solo se c'è una sessione attiva
+
         # Footer: status a sinistra, credits a destra
         footer_frame = tk.Frame(outer, bg=C["bg"])
         footer_frame.pack(fill=tk.X)
@@ -347,6 +398,20 @@ class UsageWidget:
                 if key == "seven_day_sonnet":
                     self._bars[key][0].pack(fill=tk.X, pady=(0, 5))
                 self._draw_bar(key, pct, rst)
+
+            ctx = fetch_context_window()
+            bar_f, bar_cv, bar_pl, bar_rl = self._bars["context"]
+            if ctx:
+                bar_f.pack(fill=tk.X, pady=(0, 5))
+                self._draw_bar("context", ctx["pct"], "")
+                color = C["red"] if ctx["pct"] > 85 else C["yellow"] if ctx["pct"] > 65 else C["green"]
+                bar_pl.config(text=f"{ctx['pct']:.0f}%", fg=color)
+                bar_rl.config(
+                    text=f"{ctx['tokens_used']:,} / {ctx['tokens_max']:,} tk"
+                         f"  ·  {ctx['age_min']}m fa")
+            else:
+                bar_f.pack_forget()
+
             self._dot.config(fg=C["green"])
             self._status_lbl.config(
                 text=f"Aggiornato {datetime.now().strftime('%H:%M')}")
