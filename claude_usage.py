@@ -52,6 +52,10 @@ CTX_REFRESH_SEC = 60
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CTX_MAX_TOKENS  = 200_000
 
+# Versione del widget. 1.0 = versione pre-compatta (mai numerata esplicitamente),
+# 1.1 = questa release con modalità compatta.
+APP_VERSION = "1.1"
+
 # ── Tema ──────────────────────────────────────────────────────────────────────
 C = dict(
     bg      = "#0d0d1a",
@@ -67,7 +71,11 @@ C = dict(
     track   = "#252540",
 )
 
-WIN_W = 264
+WIN_W     = 264
+# Larghezza compatta: "100%" (32px nel font) + 2×5px di padx del compact_frame =
+# margini identici di 5px a sinistra/destra. _position_window mantiene fisso il bordo
+# destro corrente, quindi riducendo la larghezza si sposta solo il margine sinistro.
+COMPACT_W = 42
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
@@ -269,19 +277,80 @@ def fmt_reset(iso_str: str) -> str:
     except Exception:
         return ""
 
+# ── Tooltip ────────────────────────────────────────────────────────────────────
+
+class Tooltip:
+    """Tooltip minimale: appare al mouse-over, sparisce all'uscita. Zero dipendenze."""
+
+    def __init__(self, widget, text: str):
+        self.widget = widget
+        self.text   = text
+        self._tip   = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _):
+        if self._tip or not self.text:
+            return
+        x = self.widget.winfo_rootx() - 6
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._tip = tk.Toplevel(self.widget)
+        self._tip.overrideredirect(True)
+        self._tip.attributes("-topmost", True)
+        tk.Label(self._tip, text=self.text,
+                 bg=C["bg2"], fg=C["fg"],
+                 font=("Segoe UI", 8),
+                 padx=6, pady=3, bd=0).pack()
+        # posiziona con il bordo destro allineato al widget (numeri right-aligned)
+        self._tip.update_idletasks()
+        tw = self._tip.winfo_reqwidth()
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() - tw
+        self._tip.geometry(f"+{x}+{y}")
+
+    def _hide(self, _):
+        if self._tip:
+            self._tip.destroy()
+            self._tip = None
+
+
 # ── Widget ─────────────────────────────────────────────────────────────────────
 
 class UsageWidget:
 
+    # ordine verticale delle voci + descrizione per il tooltip in modalità compatta
+    _KEYS = ["context", "five_hour", "seven_day", "seven_day_sonnet"]
+    _DESC = {
+        "context":          "Contesto",
+        "five_hour":        "Sessione (5h)",
+        "seven_day":        "Settimana",
+        "seven_day_sonnet": "Sonnet",
+    }
+
     def __init__(self):
-        self.creds     = {}
-        self.root      = tk.Tk()
-        self._drag_ox  = 0
-        self._drag_oy  = 0
-        self._bars     = {}
+        self.creds         = {}
+        self.root          = tk.Tk()
+        self._drag_x0      = 0
+        self._drag_y0      = 0
+        self._win_x0       = 0
+        self._win_y0       = 0
+        self._dragging     = False
+        self._bars         = {}
+        self._compact_lbls = {}
+        self._values       = {}   # key -> (pct, visible)
+        # Angolo di ancoraggio tracciato manualmente (coord. schermo del bordo destro/
+        # inferiore). Evita di leggere winfo_x/width al toggle, che su alcuni sistemi
+        # (DPI/overrideredirect) arrivano sfasati di un ciclo → posizione oscillante.
+        self._anchor_right  = None
+        self._anchor_bottom = None
+        self._cur_h         = 0
+        self.compact       = bool(_load_cfg().get("compact"))
         self._setup_window()
         self._build_ui()
-        self._position_window()
+        if self.compact:
+            self._outer.pack_forget()
+            self._compact_frame.pack(fill=tk.BOTH, expand=True)
+        self._sync_compact()
+        self._position_window(initial=True)
         self._start()
 
     # ── finestra ──────────────────────────────────────────────────────────────
@@ -297,19 +366,44 @@ class UsageWidget:
         r.bind("<B1-Motion>",     self._drag_move)
         r.bind("<Button-3>",      self._ctx_menu)
 
-    def _position_window(self):
+    def _position_window(self, initial=False):
+        """
+        initial=True → primo posizionamento in basso-destra (dimensioni schermo),
+        memorizza l'angolo di ancoraggio (bordo destro/inferiore).
+        Altrimenti → ricalcola x/y dall'angolo ancorato SALVATO (self._anchor_*),
+        NON da winfo_x/width: così il ridimensionamento è deterministico e non oscilla
+        (bug DPI/overrideredirect dove winfo_* è sfasato di un ciclo). L'ancora cambia
+        solo al drag (vedi _drag_move).
+        """
         r = self.root
         r.update_idletasks()
         h = r.winfo_reqheight()
-        sw = r.winfo_screenwidth()
-        sh = r.winfo_screenheight()
-        r.geometry(f"{WIN_W}x{h}+{sw - WIN_W - 16}+{sh - h - 52}")
+        w = COMPACT_W if self.compact else WIN_W
+        if initial or self._anchor_right is None:
+            sw = r.winfo_screenwidth()
+            sh = r.winfo_screenheight()
+            x = sw - w - 16
+            y = sh - h - 52
+            self._anchor_right  = x + w
+            self._anchor_bottom = y + h
+        else:
+            x = self._anchor_right  - w   # bordo destro ancorato
+            y = self._anchor_bottom - h   # bordo inferiore ancorato
+        self._cur_h = h
+        # Windows + overrideredirect: applicare dimensione e posizione in DUE chiamate
+        # geometry() separate. In una sola chiamata la posizione può venire ignorata o
+        # applicata a coordinate stale → salto in alto-a-sinistra a giri alterni.
+        r.geometry(f"{w}x{h}")
+        r.update_idletasks()
+        r.geometry(f"+{x}+{y}")
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        outer = tk.Frame(self.root, bg=C["bg"], padx=10, pady=8)
-        outer.pack(fill=tk.BOTH, expand=True)
+        # ── modalità estesa ────────────────────────────────────────────────
+        self._outer = tk.Frame(self.root, bg=C["bg"], padx=10, pady=8)
+        self._outer.pack(fill=tk.BOTH, expand=True)
+        outer = self._outer
 
         hdr = tk.Frame(outer, bg=C["bg"])
         hdr.pack(fill=tk.X, pady=(0, 8))
@@ -323,6 +417,11 @@ class UsageWidget:
                         bg=C["bg"], fg=C["gray"], cursor="hand2")
         gear.pack(side=tk.RIGHT, padx=(0, 6))
         gear.bind("<Button-1>", lambda _: self._show_setup())
+        collapse = tk.Label(hdr, text="⧉", font=("Segoe UI", 10),
+                            bg=C["bg"], fg=C["gray"], cursor="hand2")
+        collapse.pack(side=tk.RIGHT, padx=(0, 6))
+        collapse.bind("<Button-1>", lambda _: self._toggle_compact())
+        Tooltip(collapse, "Riduci")
 
         self._bar_frame = tk.Frame(outer, bg=C["bg"])
         self._bar_frame.pack(fill=tk.BOTH, expand=True)
@@ -362,6 +461,21 @@ class UsageWidget:
         link.bind("<Button-1>",
                   lambda _: webbrowser.open("https://www.felter.it"))
 
+        # ── modalità compatta: solo icona espandi + percentuali ────────────
+        # Figlio di root (non di outer) con padding proprio → margini 5px indipendenti.
+        self._compact_frame = tk.Frame(self.root, bg=C["bg"], padx=5, pady=8)
+        expand = tk.Label(self._compact_frame, text="⛶", font=("Segoe UI", 10),
+                          bg=C["bg"], fg=C["gray"], cursor="hand2")
+        expand.pack(pady=(0, 4))  # centrato orizzontalmente
+        expand.bind("<Button-1>", lambda _: self._toggle_compact())
+        Tooltip(expand, "Espandi")
+        for key in self._KEYS:
+            lbl = tk.Label(self._compact_frame, text="–%",
+                           font=("Segoe UI", 10, "bold"),
+                           bg=C["bg"], fg="#ddd", anchor="e")
+            self._compact_lbls[key] = lbl
+            Tooltip(lbl, self._DESC[key])
+
     def _make_bar(self, parent, label, color):
         frame = tk.Frame(parent, bg=C["bg"])
         row   = tk.Frame(frame, bg=C["bg"])
@@ -397,6 +511,37 @@ class UsageWidget:
             canvas.create_rectangle(0, 0, fw, 5, fill=color, outline="")
         reset_lbl.config(text=fmt_reset(resets_at))
 
+    # ── modalità compatta ───────────────────────────────────────────────────────
+
+    def _toggle_compact(self):
+        self.compact = not self.compact
+        if self.compact:
+            self._outer.pack_forget()
+            self._compact_frame.pack(fill=tk.BOTH, expand=True)
+        else:
+            self._compact_frame.pack_forget()
+            self._outer.pack(fill=tk.BOTH, expand=True)
+        self._save_compact_state()
+        self._sync_compact()
+        self._position_window()
+
+    def _save_compact_state(self):
+        cfg = _load_cfg()
+        cfg["compact"] = self.compact
+        _save_cfg(cfg)
+
+    def _sync_compact(self):
+        """Allinea i label compatti ai valori correnti, stesso ordine del pieno."""
+        # nascondi tutti, poi ri-packa i visibili in ordine (dopo l'icona espandi)
+        for lbl in self._compact_lbls.values():
+            lbl.pack_forget()
+        for key in self._KEYS:
+            pct, visible = self._values.get(key, (0, False))
+            if visible:
+                lbl = self._compact_lbls[key]
+                lbl.config(text=f"{pct:.0f}%", fg=bar_color(pct))
+                lbl.pack(fill=tk.X, pady=1)
+
     # ── dati ──────────────────────────────────────────────────────────────────
 
     def apply_data(self, data: dict):
@@ -405,6 +550,7 @@ class UsageWidget:
                 bucket = data.get(key)
                 if bucket is None:
                     self._bars[key][0].pack_forget()
+                    self._values[key] = (0, False)
                     continue
                 pct = float(bucket.get("utilization") or
                             bucket.get("utilization_pct") or 0)
@@ -413,10 +559,12 @@ class UsageWidget:
                 if key == "seven_day_sonnet":
                     self._bars[key][0].pack(fill=tk.X, pady=(0, 5))
                 self._draw_bar(key, pct, rst)
+                self._values[key] = (pct, True)
 
             self._dot.config(fg=C["green"])
             self._status_lbl.config(
                 text=f"Aggiornato {datetime.now().strftime('%H:%M')}")
+            self._sync_compact()
             self._position_window()
         self.root.after(0, update)
 
@@ -445,8 +593,11 @@ class UsageWidget:
                 bar_rl.config(
                     text=f"{ctx['tokens_used']:,} / {ctx['tokens_max']:,} tk"
                          f"  ·  {ctx['age_min']}m fa")
+                self._values["context"] = (ctx["pct"], True)
             else:
                 bar_f.pack_forget()
+                self._values["context"] = (0, False)
+            self._sync_compact()
             self._position_window()
         self.root.after(0, update)
         self.root.after(CTX_REFRESH_SEC * 1000, self._refresh_context)
@@ -481,13 +632,31 @@ class UsageWidget:
     # ── drag ──────────────────────────────────────────────────────────────────
 
     def _drag_start(self, e):
-        self._drag_ox = e.x
-        self._drag_oy = e.y
+        # Registra il punto di partenza in coordinate schermo (x_root/y_root) e la
+        # posizione della finestra ORA, mentre è ferma (winfo_x affidabile). Durante il
+        # resize dei toggle winfo_x è stale, quindi non lo leggiamo mai in _drag_move.
+        self._drag_x0  = e.x_root
+        self._drag_y0  = e.y_root
+        self._win_x0   = self.root.winfo_x()
+        self._win_y0   = self.root.winfo_y()
+        self._dragging = False
 
     def _drag_move(self, e):
-        x = self.root.winfo_x() + e.x - self._drag_ox
-        y = self.root.winfo_y() + e.y - self._drag_oy
+        dx = e.x_root - self._drag_x0
+        dy = e.y_root - self._drag_y0
+        # Soglia anti-jitter: un clic sull'icona toggle/gear muove il mouse di 1-2px e
+        # NON deve essere trattato come drag (altrimenti corrompe l'ancora → la finestra
+        # salta a ogni toggle). Solo oltre 5px diventa un vero trascinamento.
+        if not self._dragging and abs(dx) < 5 and abs(dy) < 5:
+            return
+        self._dragging = True
+        x = self._win_x0 + dx
+        y = self._win_y0 + dy
         self.root.geometry(f"+{x}+{y}")
+        # aggiorna l'ancora così i futuri toggle/refresh restano dove l'utente trascina
+        w = COMPACT_W if self.compact else WIN_W
+        self._anchor_right  = x + w
+        self._anchor_bottom = y + self._cur_h
 
     # ── menu ──────────────────────────────────────────────────────────────────
 
@@ -513,7 +682,7 @@ class UsageWidget:
         dlg = tk.Toplevel(self.root)
         dlg.title("Impostazioni – Claude Usage Widget")
         dlg.configure(bg=C["bg"])
-        dlg.geometry("420x470")
+        dlg.geometry("420x500")
         dlg.attributes("-topmost", True)
         dlg.resizable(False, False)
         dlg.grab_set()
@@ -605,6 +774,20 @@ class UsageWidget:
                   font=("Segoe UI", 9),
                   relief=tk.FLAT, cursor="hand2",
                   padx=10, pady=5).pack(fill=tk.X)
+
+        # ── Footer: versione a sinistra, credit a destra (come nel widget) ────
+        foot = tk.Frame(pad, bg=C["bg"])
+        foot.pack(side=tk.BOTTOM, fill=tk.X, pady=(12, 0))
+        tk.Label(foot, text=f"v{APP_VERSION}",
+                 font=("Segoe UI", 7), bg=C["bg"], fg=C["gray"]).pack(side=tk.LEFT)
+        flink = tk.Label(foot, text="Felter Roberto",
+                         font=("Segoe UI", 7), bg=C["bg"],
+                         fg=C["accent"], cursor="hand2")
+        flink.pack(side=tk.RIGHT)
+        tk.Label(foot, text="by ",
+                 font=("Segoe UI", 7), bg=C["bg"], fg=C["gray"]).pack(side=tk.RIGHT)
+        flink.bind("<Button-1>",
+                   lambda _: webbrowser.open("https://www.felter.it"))
 
     # ── run ───────────────────────────────────────────────────────────────────
 

@@ -1,5 +1,7 @@
 # ⬡ Claude Usage Widget — Windows
 
+> Documentazione relativa alla **versione 1.1** del widget.
+
 Widget flottante always-on-top che mostra in tempo reale:
 
 - **Contesto** — solo se in uso claude code (aggiornato ogni minuto)
@@ -41,8 +43,22 @@ Non è necessario installare Node.js o utilizzare il terminale per autenticarsi.
 | **Trascina** il widget | Lo sposti dove vuoi sullo schermo |
 | **Tasto destro** | Menu contestuale: Aggiorna / Impostazioni / Chiudi |
 | **⚙** (in alto a destra) | Apre la finestra delle impostazioni / inserimento chiave |
+| **⧉** (in alto a destra) | Riduce il widget alla **barra compatta** |
+| **⛶** (nella barra compatta) | Riespande il widget alla vista completa |
 
 Il widget si aggiorna automaticamente con tempistiche diverse a seconda della barra.
+
+### Modalità compatta
+
+Cliccando l'icona **⧉** il widget si riduce a una barra verticale stretta che mostra
+**solo le percentuali**, colorate secondo le stesse soglie (verde/giallo/rosso). Le voci
+restano nello stesso ordine verticale della vista completa, così sono riconoscibili anche
+senza etichetta; passando il mouse su una percentuale compare un **tooltip** con la
+descrizione (Contesto / Sessione 5h / Settimana / Sonnet). Il bordo destro resta ancorato,
+quindi il widget non si sposta orizzontalmente durante la riduzione.
+
+L'icona **⛶** nella barra compatta riporta alla vista completa. Lo **stato scelto
+(compatto o esteso) viene ricordato** e ripristinato al successivo avvio.
 
 ---
 
