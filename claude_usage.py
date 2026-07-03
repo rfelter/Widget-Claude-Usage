@@ -19,26 +19,64 @@ AUTH — supporta DUE metodi, scegli quello che preferisci:
 Dipendenze:
     pip install requests
     (tkinter è già incluso in Python standard)
+
+Nota sicurezza: i token sono salvati IN CHIARO in ~/.claude_usage_widget.json,
+protetti solo dall'ACL del profilo utente Windows. Non sincronizzare quel file
+su cloud/backup condivisi.
+
+Log: errori e warning in ~/.claude_usage_widget.log (rotazione a ~200 KB).
 """
 
 import tkinter as tk
 import threading
 import json
+import logging
 import os
 import sys
 import re
 import webbrowser
 import time
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Il widget gira con pythonw (niente console): senza log su file ogni errore
+# nei thread o nelle callback Tk sarebbe invisibile.
+LOG_FILE = os.path.join(os.path.expanduser("~"), ".claude_usage_widget.log")
+log = logging.getLogger("claude_usage")
+log.setLevel(logging.WARNING)
+try:
+    _handler = RotatingFileHandler(LOG_FILE, maxBytes=200_000,
+                                   backupCount=1, encoding="utf-8")
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log.addHandler(_handler)
+except OSError:
+    pass  # file di log non scrivibile: si prosegue senza log
 
 try:
     import requests
 except ImportError:
     import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install",
-                           "requests", "-q"])
-    import requests
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "requests", "-q"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        import requests
+        log.warning("Libreria 'requests' mancante: installata automaticamente")
+    except Exception:
+        log.exception("Installazione automatica di 'requests' fallita")
+        from tkinter import messagebox
+        _tmp = tk.Tk()
+        _tmp.withdraw()
+        messagebox.showerror(
+            "Claude Usage Widget",
+            "La libreria 'requests' non è installata e l'installazione\n"
+            "automatica è fallita.\n\n"
+            "Esegui:  pip install requests\n"
+            "oppure avvia il widget con avvia_widget.bat.")
+        sys.exit(1)
 
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 OAUTH_URL    = "https://api.anthropic.com/api/oauth/usage"
@@ -53,8 +91,8 @@ CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CTX_MAX_TOKENS  = 200_000
 
 # Versione del widget. 1.0 = versione pre-compatta (mai numerata esplicitamente),
-# 1.1 = questa release con modalità compatta.
-APP_VERSION = "1.1"
+# 1.1 = modalità compatta, 1.2 = hardening (thread unico, logging, fix minori).
+APP_VERSION = "1.2"
 
 # ── Tema ──────────────────────────────────────────────────────────────────────
 C = dict(
@@ -87,8 +125,12 @@ def _load_cfg() -> dict:
         return {}
 
 def _save_cfg(data: dict):
-    with open(CFG_FILE, "w", encoding="utf-8") as f:
+    # Scrittura atomica: un crash a metà json.dump non deve troncare il file
+    # (perderebbe i token salvati). Temp nella stessa cartella + os.replace.
+    tmp = CFG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp, CFG_FILE)
 
 def load_credentials() -> dict:
     """
@@ -125,10 +167,13 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/124.0.0.0 Safari/537.36")
 
+# Session condivisa: riusa le connessioni TLS (keep-alive) tra i refresh
+_http = requests.Session()
+
 
 def _fetch_with_oauth(token: str) -> dict:
     """Usa l'endpoint OAuth ufficiale."""
-    r = requests.get(
+    r = _http.get(
         OAUTH_URL,
         headers={
             "Authorization":  f"Bearer {token}",
@@ -159,7 +204,7 @@ def _fetch_with_session(session_key: str) -> dict:
     }
 
     # Passo 1: ottieni l'org UUID
-    r = requests.get(ORGS_URL, cookies=cookies, headers=headers, timeout=12)
+    r = _http.get(ORGS_URL, cookies=cookies, headers=headers, timeout=12)
     if r.status_code == 401:
         raise RuntimeError("sessionKey non valido o scaduto (401) — ricopialo da Edge")
     r.raise_for_status()
@@ -168,11 +213,13 @@ def _fetch_with_session(session_key: str) -> dict:
     orgs = body if isinstance(body, list) else body.get("organizations", [body])
     if not orgs:
         raise RuntimeError("Nessuna organizzazione trovata")
-    org_uuid = orgs[0]["uuid"]
+    org_uuid = orgs[0].get("uuid") if isinstance(orgs[0], dict) else None
+    if not org_uuid:
+        raise RuntimeError("Risposta organizations inattesa (manca uuid)")
 
     # Passo 2: endpoint corretto confermato da estensioni open-source
     usage_url = f"https://claude.ai/api/organizations/{org_uuid}/usage"
-    r2 = requests.get(usage_url, cookies=cookies, headers=headers, timeout=12)
+    r2 = _http.get(usage_url, cookies=cookies, headers=headers, timeout=12)
     if r2.status_code == 404:
         raise RuntimeError("Endpoint /usage non trovato (404)")
     r2.raise_for_status()
@@ -198,10 +245,32 @@ def fetch_usage(creds: dict) -> dict:
     raise RuntimeError(" | ".join(errs) or "Nessun metodo di autenticazione disponibile")
 
 
+def _read_tail_lines(path: Path, max_bytes: int = 262_144) -> list[str]:
+    """
+    Legge solo la coda del file (ultimi max_bytes): i transcript .jsonl di
+    Claude Code arrivano a decine di MB e l'ultimo messaggio assistant è
+    sempre negli ultimi KB. Evita read_text() dell'intero file ogni 60s.
+    """
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        data = f.read()
+    lines = data.decode("utf-8", errors="ignore").splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]  # la prima riga è quasi certamente troncata
+    return lines
+
+
+def _ctx_max_for(model_id: str) -> int:
+    """Finestra contesto del modello: 1M per gli ID con suffisso [1m], 200K default."""
+    return 1_000_000 if "[1m]" in model_id else CTX_MAX_TOKENS
+
+
 def fetch_context_window() -> dict | None:
     """
     Legge il .jsonl più recente in ~/.claude/projects/*/
-    e restituisce {pct, tokens_used, tokens_max, age_min}
+    e restituisce {pct, tokens_used, tokens_max, age_min, model}
     oppure None se nessuna sessione attiva trovata (>4h).
     """
     try:
@@ -209,13 +278,12 @@ def fetch_context_window() -> dict | None:
         if not jsonl_files:
             return None
 
-        latest = max(jsonl_files, key=lambda f: f.stat().st_mtime)
+        latest  = max(jsonl_files, key=lambda f: f.stat().st_mtime)
         age_min = (time.time() - latest.stat().st_mtime) / 60
         if age_min > 240:
             return None
 
-        lines = latest.read_text(encoding="utf-8", errors="ignore").splitlines()
-        for line in reversed(lines):
+        for line in reversed(_read_tail_lines(latest)):
             if not line.strip():
                 continue
             try:
@@ -232,24 +300,32 @@ def fetch_context_window() -> dict | None:
                 )
                 if tokens == 0:
                     return None
+                model_id = msg.get("model") or ""
+                ctx_max  = _ctx_max_for(model_id)
                 return {
-                    "pct":         min(tokens / CTX_MAX_TOKENS * 100, 100),
+                    "pct":         min(tokens / ctx_max * 100, 100),
                     "tokens_used": tokens,
-                    "tokens_max":  CTX_MAX_TOKENS,
+                    "tokens_max":  ctx_max,
                     "age_min":     int(age_min),
-                    "model":       _fmt_model(msg.get("model") or ""),
+                    "model":       _fmt_model(model_id),
                 }
         return None
     except Exception:
+        log.exception("Lettura context window fallita")
         return None
 
 
 def _fmt_model(model_id: str) -> str:
-    """'claude-sonnet-4-6' → 'Sonnet 4.6',  'claude-haiku-4-5-20251001' → 'Haiku 4.5'"""
-    m = re.match(r"claude-(\w+)-(\d+)-(\d+)", model_id)
-    if m:
-        return f"{m.group(1).capitalize()} {m.group(2)}.{m.group(3)}"
-    return model_id
+    """
+    'claude-sonnet-4-6' → 'Sonnet 4.6',  'claude-haiku-4-5-20251001' → 'Haiku 4.5',
+    'claude-fable-5' → 'Fable 5'. Il lookahead (?!\\d) evita di catturare come
+    minor la data a 8 cifre (es. 'claude-opus-4-20250514' → 'Opus 4').
+    """
+    m = re.match(r"claude-(\w+?)-(\d+)(?:-(\d{1,2})(?!\d))?", model_id)
+    if not m:
+        return model_id
+    name = f"{m.group(1).capitalize()} {m.group(2)}"
+    return f"{name}.{m.group(3)}" if m.group(3) else name
 
 # ── Utilità UI ────────────────────────────────────────────────────────────────
 
@@ -292,7 +368,6 @@ class Tooltip:
     def _show(self, _):
         if self._tip or not self.text:
             return
-        x = self.widget.winfo_rootx() - 6
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
         self._tip = tk.Toplevel(self.widget)
         self._tip.overrideredirect(True)
@@ -337,6 +412,8 @@ class UsageWidget:
         self._bars         = {}
         self._compact_lbls = {}
         self._values       = {}   # key -> (pct, visible)
+        self._wake         = threading.Event()  # sveglia il refresh loop
+        self._loop_started = False               # un solo thread di refresh
         # Angolo di ancoraggio tracciato manualmente (coord. schermo del bordo destro/
         # inferiore). Evita di leggere winfo_x/width al toggle, che su alcuni sistemi
         # (DPI/overrideredirect) arrivano sfasati di un ciclo → posizione oscillante.
@@ -358,6 +435,10 @@ class UsageWidget:
     def _setup_window(self):
         r = self.root
         r.title("Claude Usage")
+        # Con pythonw i traceback delle callback Tk andrebbero persi: logghiamoli
+        r.report_callback_exception = \
+            lambda exc, val, tb: log.error("Errore in callback Tk",
+                                           exc_info=(exc, val, tb))
         r.configure(bg=C["bg"])
         r.attributes("-topmost", True)
         r.attributes("-alpha",   0.94)
@@ -577,30 +658,41 @@ class UsageWidget:
     # ── refresh context window ────────────────────────────────────────────────
 
     def _refresh_context(self):
-        ctx = fetch_context_window()
-        def update():
-            bar_f, bar_cv, bar_pl, bar_rl = self._bars["context"]
-            if ctx:
-                self._ctx_title_lbl.config(
-                    text=f"Contesto  ({ctx['model']})" if ctx["model"] else "Contesto")
-                bar_f.pack(fill=tk.X, pady=(0, 5),
-                           before=self._bars["five_hour"][0])
-                self._draw_bar("context", ctx["pct"], "")
-                color = (C["red"] if ctx["pct"] > 85
-                         else C["yellow"] if ctx["pct"] > 65
-                         else C["green"])
-                bar_pl.config(text=f"{ctx['pct']:.0f}%", fg=color)
-                bar_rl.config(
-                    text=f"{ctx['tokens_used']:,} / {ctx['tokens_max']:,} tk"
-                         f"  ·  {ctx['age_min']}m fa")
-                self._values["context"] = (ctx["pct"], True)
-            else:
-                bar_f.pack_forget()
-                self._values["context"] = (0, False)
-            self._sync_compact()
-            self._position_window()
-        self.root.after(0, update)
+        # I/O su file (glob + lettura .jsonl) fuori dal thread Tk: sul main
+        # thread causava micro-freeze della UI a ogni ciclo da 60s.
+        def worker():
+            ctx = fetch_context_window()
+            self.root.after(0, lambda: self._apply_context(ctx))
+        threading.Thread(target=worker, daemon=True).start()
         self.root.after(CTX_REFRESH_SEC * 1000, self._refresh_context)
+
+    def _apply_context(self, ctx: dict | None):
+        bar_f, _, _, bar_rl = self._bars["context"]
+        if ctx:
+            self._ctx_title_lbl.config(
+                text=f"Contesto  ({ctx['model']})" if ctx["model"] else "Contesto")
+            # pack(before=) fallisce se il riferimento non è packato (es. API
+            # senza five_hour): ancora alla prima barra visibile, altrimenti
+            # pack semplice (il frame contesto resta comunque in _bar_frame).
+            anchor = next(
+                (self._bars[k][0]
+                 for k in ("five_hour", "seven_day", "seven_day_sonnet")
+                 if self._bars[k][0].winfo_manager()),
+                None)
+            if anchor is not None:
+                bar_f.pack(fill=tk.X, pady=(0, 5), before=anchor)
+            else:
+                bar_f.pack(fill=tk.X, pady=(0, 5))
+            self._draw_bar("context", ctx["pct"], "")
+            bar_rl.config(
+                text=f"{ctx['tokens_used']:,} / {ctx['tokens_max']:,} tk"
+                     f"  ·  {ctx['age_min']}m fa")
+            self._values["context"] = (ctx["pct"], True)
+        else:
+            bar_f.pack_forget()
+            self._values["context"] = (0, False)
+        self._sync_compact()
+        self._position_window()
 
     # ── refresh utilizzo API ──────────────────────────────────────────────────
 
@@ -613,20 +705,33 @@ class UsageWidget:
             data = fetch_usage(self.creds)
             self.apply_data(data)
         except Exception as e:
+            log.warning("Refresh utilizzo fallito: %s", e)
             self.show_error(str(e)[:40])
 
     def _refresh_loop(self):
-        self._refresh_once()
         while True:
-            time.sleep(REFRESH_SEC)
+            self._wake.clear()
             self._refresh_once()
+            self._wake.wait(REFRESH_SEC)
+
+    def _start_refresh_loop(self):
+        """
+        Avvia il thread di refresh (una sola volta) o, se già attivo, forza un
+        refresh immediato. Evita i thread duplicati che si accumulavano a ogni
+        salvataggio dal dialog impostazioni.
+        """
+        if self._loop_started:
+            self._wake.set()
+            return
+        self._loop_started = True
+        threading.Thread(target=self._refresh_loop, daemon=True).start()
 
     def _start(self):
         self.creds = load_credentials()
         if not self.creds:
             self.root.after(200, self._show_setup)
         else:
-            threading.Thread(target=self._refresh_loop, daemon=True).start()
+            self._start_refresh_loop()
         self._refresh_context()  # avvia loop autonomo context window (ogni 60s)
 
     # ── drag ──────────────────────────────────────────────────────────────────
@@ -667,13 +772,17 @@ class UsageWidget:
                     activeforeground=C["accent"],
                     bd=0, relief=tk.FLAT)
         m.add_command(label="🔄  Aggiorna ora",
-                      command=lambda: threading.Thread(
-                          target=self._refresh_once, daemon=True).start())
+                      command=self._start_refresh_loop)
         m.add_separator()
         m.add_command(label="⚙  Impostazioni", command=self._show_setup)
         m.add_separator()
         m.add_command(label="✕  Chiudi",       command=self.root.destroy)
-        m.post(e.x_root, e.y_root)
+        # tk_popup + grab_release: con overrideredirect m.post può lasciare
+        # il grab appeso (menu che non si chiude / widget che non risponde)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
 
     # ── setup ─────────────────────────────────────────────────────────────────
 
@@ -710,16 +819,27 @@ class UsageWidget:
                      padx=8, pady=4, wraplength=370,
                      justify=tk.LEFT).pack(fill=tk.X, pady=1)
 
+        def secret_entry(var):
+            # Campo token mascherato (screen-sharing safe) + occhio per rivelare
+            row = tk.Frame(pad, bg=C["bg2"])
+            ent = tk.Entry(row, textvariable=var, show="•",
+                           font=("Courier New", 8),
+                           bg=C["bg2"], fg=C["fg"],
+                           insertbackground=C["fg"],
+                           relief=tk.FLAT, bd=0)
+            ent.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
+            eye = tk.Label(row, text="👁", bg=C["bg2"], fg=C["gray"],
+                           font=("Segoe UI", 9), cursor="hand2", padx=6)
+            eye.pack(side=tk.RIGHT)
+            eye.bind("<Button-1>",
+                     lambda _: ent.config(show="" if ent.cget("show") else "•"))
+            return row
+
         tk.Label(pad, text="sessionKey:",
                  bg=C["bg"], fg="#aaa",
                  font=("Segoe UI", 8)).pack(anchor="w", pady=(4, 0))
         sk_var = tk.StringVar(value=cfg.get("session_key", ""))
-        sk_ent = tk.Entry(pad, textvariable=sk_var,
-                          font=("Courier New", 8),
-                          bg=C["bg2"], fg=C["fg"],
-                          insertbackground=C["fg"],
-                          relief=tk.FLAT, bd=0)
-        sk_ent.pack(fill=tk.X, ipady=6, pady=(2, 0))
+        secret_entry(sk_var).pack(fill=tk.X, pady=(2, 0))
 
         sep = tk.Frame(pad, height=1, bg="#333")
         sep.pack(fill=tk.X, pady=10)
@@ -733,12 +853,7 @@ class UsageWidget:
                  bg=C["bg"], fg="#aaa",
                  font=("Segoe UI", 8)).pack(anchor="w", pady=(4, 0))
         ot_var = tk.StringVar(value=cfg.get("oauth_token", ""))
-        ot_ent = tk.Entry(pad, textvariable=ot_var,
-                          font=("Courier New", 8),
-                          bg=C["bg2"], fg=C["fg"],
-                          insertbackground=C["fg"],
-                          relief=tk.FLAT, bd=0)
-        ot_ent.pack(fill=tk.X, ipady=6, pady=(2, 0))
+        secret_entry(ot_var).pack(fill=tk.X, pady=(2, 0))
 
         msg_lbl = tk.Label(pad, text="",
                            bg=C["bg"], fg=C["red"],
@@ -759,7 +874,7 @@ class UsageWidget:
             _save_cfg(new_cfg)
             self.creds = load_credentials()
             dlg.destroy()
-            threading.Thread(target=self._refresh_loop, daemon=True).start()
+            self._start_refresh_loop()
 
         tk.Button(pad, text="💾  Salva e aggiorna",
                   command=save_and_close,

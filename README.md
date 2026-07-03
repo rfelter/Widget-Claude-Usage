@@ -1,6 +1,6 @@
 # ⬡ Claude Usage Widget — Windows
 
-> Documentazione relativa alla **versione 1.1** del widget.
+> Documentazione relativa alla **versione 1.2** del widget.
 
 Widget flottante always-on-top che mostra in tempo reale:
 
@@ -91,6 +91,8 @@ La `sessionKey` può scadere se effettui il logout dal browser o dopo un certo p
 
 - Il widget comunica **solo** con i server ufficiali di Anthropic (`api.anthropic.com` e `claude.ai`).
 - Le credenziali e la `sessionKey` sono salvate localmente sul tuo PC nel file di configurazione `~/.claude_usage_widget.json` (nella cartella del tuo profilo utente) e non vengono mai condivise o inviate altrove.
+- ⚠ **I token sono salvati in chiaro** in quel file, protetto solo dai permessi del tuo profilo utente Windows: non sincronizzarlo su cloud o backup condivisi e non condividerlo. La `sessionKey` equivale alla tua sessione claude.ai completa.
+- Eventuali errori vengono registrati in `~/.claude_usage_widget.log` (solo messaggi tecnici, mai token).
 - Nessuna telemetria, nessun sistema di tracciamento.
 
 ---
