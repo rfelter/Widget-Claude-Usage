@@ -1,11 +1,13 @@
 @echo off
 :: Claude Usage Widget - Launcher per Windows
-:: Doppio clic su questo file per avviare il widget
+:: Doppio clic per avviare. La console appare per un istante: e' intrinseco ai .bat.
+:: Per l'avvio SENZA alcuna finestra (es. avvio automatico) usare avvia_widget.vbs
 
 title Claude Usage Widget
 
-:: Controlla che Python sia installato
-python --version >nul 2>&1
+:: Controlla che Python (pythonw) sia installato — "where" e' istantaneo,
+:: non avvia l'interprete come faceva "python --version"
+where pythonw >nul 2>&1
 if %errorlevel% neq 0 (
     echo Python non trovato.
     echo Scaricalo da https://www.python.org/downloads/
@@ -14,12 +16,6 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: Installa requests se necessario
-python -c "import requests" >nul 2>&1
-if %errorlevel% neq 0 (
-    echo Installazione dipendenze...
-    python -m pip install requests -q
-)
-
-:: Avvia il widget
-start /b pythonw "%~dp0claude_usage.py"
+:: Avvia il widget. Le dipendenze mancanti (requests) le gestisce lo script
+:: stesso: auto-install silenzioso, messaggio d'errore se fallisce.
+start "" /b pythonw "%~dp0claude_usage.py"

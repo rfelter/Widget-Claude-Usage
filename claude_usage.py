@@ -91,8 +91,9 @@ CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 CTX_MAX_TOKENS  = 200_000
 
 # Versione del widget. 1.0 = versione pre-compatta (mai numerata esplicitamente),
-# 1.1 = modalità compatta, 1.2 = hardening (thread unico, logging, fix minori).
-APP_VERSION = "1.2"
+# 1.1 = modalità compatta, 1.2 = hardening (thread unico, logging, fix minori),
+# 1.3 = barra Crediti di utilizzo (extra_usage).
+APP_VERSION = "1.3"
 
 # ── Tema ──────────────────────────────────────────────────────────────────────
 C = dict(
@@ -353,6 +354,25 @@ def fmt_reset(iso_str: str) -> str:
     except Exception:
         return ""
 
+
+def fmt_money(amount_minor, currency="EUR", exponent=2) -> str:
+    """
+    202, 'EUR', 2 → '€2,02'. Unità minori → maggiori; virgola decimale (IT).
+    Difensivo sui dati API (non fidati): valori null/non numerici → 0,
+    exponent forzato in 0..4 (evita 10**n assurdi).
+    """
+    currency = currency or "EUR"
+    sym = {"EUR": "€", "USD": "$", "GBP": "£"}.get(currency, f"{currency} ")
+    try:
+        exp = max(0, min(int(exponent), 4))
+    except (TypeError, ValueError):
+        exp = 2
+    try:
+        val = float(amount_minor or 0) / (10 ** exp)
+    except (TypeError, ValueError):
+        val = 0.0
+    return f"{sym}{val:.{exp}f}".replace(".", ",")
+
 # ── Tooltip ────────────────────────────────────────────────────────────────────
 
 class Tooltip:
@@ -393,12 +413,13 @@ class Tooltip:
 class UsageWidget:
 
     # ordine verticale delle voci + descrizione per il tooltip in modalità compatta
-    _KEYS = ["context", "five_hour", "seven_day", "seven_day_sonnet"]
+    _KEYS = ["context", "five_hour", "seven_day", "seven_day_sonnet", "credits"]
     _DESC = {
         "context":          "Contesto",
         "five_hour":        "Sessione (5h)",
         "seven_day":        "Settimana",
         "seven_day_sonnet": "Sonnet",
+        "credits":          "Crediti",
     }
 
     def __init__(self):
@@ -525,6 +546,11 @@ class UsageWidget:
             else:
                 f.pack(fill=tk.X, pady=(0, 5))
 
+        # Barra Crediti di utilizzo (extra_usage): mostrata solo se attiva sul piano
+        f, cv, pl, rl, _ = self._make_bar(self._bar_frame, "Crediti", C["accent"])
+        self._bars["credits"] = (f, cv, pl, rl)
+        f.pack_forget()
+
         # Footer: status a sinistra, credits a destra
         footer_frame = tk.Frame(outer, bg=C["bg"])
         footer_frame.pack(fill=tk.X)
@@ -641,6 +667,27 @@ class UsageWidget:
                     self._bars[key][0].pack(fill=tk.X, pady=(0, 5))
                 self._draw_bar(key, pct, rst)
                 self._values[key] = (pct, True)
+
+            # Crediti di utilizzo (extra_usage): shape diversa dalle barre standard,
+            # gestita a parte. reset_lbl riusato per "€usato / €limite" (come Contesto).
+            eu = data.get("extra_usage")
+            cred_f, _, _, cred_rl = self._bars["credits"]
+            # isinstance: shape non-dict (cambio API) non deve far crashare update().
+            # "or": molti campi di questa API arrivano come null espliciti, per cui
+            # .get(chiave, default) non basta a coprirli.
+            if isinstance(eu, dict) and eu.get("is_enabled"):
+                pct = float(eu.get("utilization") or 0)
+                cur = eu.get("currency") or "EUR"
+                dp  = eu.get("decimal_places")  # null gestito da fmt_money
+                cred_f.pack(fill=tk.X, pady=(0, 5))
+                self._draw_bar("credits", pct, "")
+                cred_rl.config(
+                    text=f"{fmt_money(eu.get('used_credits'), cur, dp)} / "
+                         f"{fmt_money(eu.get('monthly_limit'), cur, dp)}")
+                self._values["credits"] = (pct, True)
+            else:
+                cred_f.pack_forget()
+                self._values["credits"] = (0, False)
 
             self._dot.config(fg=C["green"])
             self._status_lbl.config(

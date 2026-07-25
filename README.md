@@ -1,12 +1,13 @@
 # ⬡ Claude Usage Widget — Windows
 
-> Documentazione relativa alla **versione 1.2** del widget.
+> Documentazione relativa alla **versione 1.3** del widget.
 
 Widget flottante always-on-top che mostra in tempo reale:
 
 - **Contesto** — solo se in uso claude code (aggiornato ogni minuto)
 - **Sessione 5h** — % usata + countdown al reset (aggiornato ogni 5 minuti)
 - **Settimana** — % usata + countdown al reset  (aggiornato ogni 5 minuti)
+- **Crediti** — crediti di utilizzo extra: % usata + valore usato/tetto in valuta (solo se attivi sul piano)
 
 Stessi dati di `Impostazioni → Utilizzo` in Claude Desktop.
 
@@ -97,8 +98,24 @@ La `sessionKey` può scadere se effettui il logout dal browser o dopo un certo p
 
 ---
 
-## Avvio automatico con Windows
+## Avvio senza finestra e avvio automatico con Windows
 
-Per fare in modo che il widget si avvii da solo all'accensione del PC:
-1. Premi **Win + R** sulla tastiera, digita `shell:startup` e premi Invio.
-2. Crea e incolla nella cartella che si apre un collegamento al file `avvia_widget.bat`.
+Il file `.bat` apre per sua natura una finestra di console (visibile per un istante) —
+è un limite del formato, non un bug. Per un avvio a **zero finestre**:
+
+1. Tasto destro su **`crea_collegamento_silenzioso.ps1`** → **Esegui con PowerShell**
+   (una tantum). Genera nella stessa cartella il file
+   **"Avvia Widget (silenzioso).lnk"**, puntato direttamente a `pythonw.exe`.
+2. Usa quel collegamento per l'avvio quotidiano (doppio clic, o copialo sul Desktop).
+3. Per l'avvio automatico all'accensione: premi **Win + R**, digita `shell:startup`,
+   premi Invio, e copia lì lo stesso collegamento.
+
+> **Perché uno script generatore e non un `.vbs` pronto?** L'associazione file `.vbs`
+> non è affidabile su tutte le installazioni Windows (Microsoft sta deprecando
+> VBScript; su alcuni PC il doppio clic su `.vbs` non apre nulla). Un collegamento
+> `.lnk` puntato a `pythonw.exe` evita del tutto il problema — Explorer lo esegue
+> nativamente. Lo script genera il collegamento con il percorso Python corretto per
+> **il tuo PC**, quindi va eseguito una volta su ogni macchina in cui installi il widget.
+>
+> Il `.bat` resta comunque utile per il primo avvio: mostra messaggi diagnostici
+> (es. Python non installato).
