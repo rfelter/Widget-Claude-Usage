@@ -1,6 +1,6 @@
 # ⬡ Claude Usage Widget — Windows
 
-> Documentazione relativa alla **versione 1.3** del widget.
+> Documentazione relativa alla **versione 1.4** del widget.
 
 Widget flottante always-on-top che mostra in tempo reale:
 
@@ -76,6 +76,23 @@ Trascina il widget nell'angolo in basso a sinistra della finestra di Claude Desk
 | 🟢 Verde | Meno del 65% di utilizzo |
 | 🟡 Giallo | Tra il 65% e l'85% di utilizzo |
 | 🔴 Rosso | Oltre l'85% di utilizzo |
+
+### Colori della riga sotto la barra
+
+La riga piccola sotto ogni barra (`Reset tra…`, token usati, crediti) resta in
+**grigio neutro finché l'utilizzo è sotto il 65%**: sotto quella soglia non c'è
+niente da segnalare. Superata la soglia si accende, con due logiche diverse:
+
+| Riga | Da 65% in su |
+|------|--------------|
+| **Reset tra…** (Sessione, Settimana, Sonnet) | 🟡 finché manca più del 20% della finestra al reset · 🟢 quando il reset è vicino |
+| **Contesto** e **Crediti** | stesso colore della barra (🟡 → 🔴) |
+
+Il **rosso non compare mai sul countdown di reset**: è riservato al consumo
+(barra e percentuale). Il tempo che manca al reset non è di per sé una cattiva
+notizia — una finestra appena azzerata è lo stato più sano possibile ed è anche
+il più lontano dal reset — quindi colorarlo di rosso darebbe due segnali opposti
+sulla stessa riga.
 
 ---
 
