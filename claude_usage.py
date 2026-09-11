@@ -92,8 +92,9 @@ CTX_MAX_TOKENS  = 200_000
 
 # Versione del widget. 1.0 = versione pre-compatta (mai numerata esplicitamente),
 # 1.1 = modalità compatta, 1.2 = hardening (thread unico, logging, fix minori),
-# 1.3 = barra Crediti di utilizzo (extra_usage).
-APP_VERSION = "1.3"
+# 1.3 = barra Crediti di utilizzo (extra_usage),
+# 1.4 = sub-label sotto le barre leggibili e a colore contestuale.
+APP_VERSION = "1.4"
 
 # ── Tema ──────────────────────────────────────────────────────────────────────
 C = dict(
@@ -102,6 +103,9 @@ C = dict(
     fg      = "#e2e2e2",
     accent  = "#e88c30",
     gray    = "#555",
+    # Neutro dei sub-label sotto le barre: #555 rendeva 2,6:1 sul fondo (sotto
+    # ogni soglia WCAG), questo sta a ~6,8:1 restando un grigio di secondo piano.
+    sub     = "#9090a8",
     green   = "#22c55e",
     yellow  = "#f59e0b",
     red     = "#ef4444",
@@ -336,23 +340,64 @@ def bar_color(pct: float) -> str:
     return C["green"]
 
 
-def fmt_reset(iso_str: str) -> str:
+# Soglia di utilizzo oltre la quale i sub-label smettono di essere neutri.
+# Coincide con la soglia gialla della barra: la riga si accende tutta insieme.
+ALERT_PCT = 65
+# Durata nominale della finestra di ogni bucket, per normalizzare il tempo
+# residuo al reset ("2h" significa cose opposte su 5h e su 7 giorni).
+WINDOW_SEC = {
+    "five_hour":        5 * 3600,
+    "seven_day":        7 * 86400,
+    "seven_day_sonnet": 7 * 86400,
+}
+
+
+def reset_seconds(iso_str: str):
+    """Secondi mancanti al reset; None se la data manca o non è interpretabile."""
     if not iso_str:
-        return ""
+        return None
     try:
-        dt   = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        diff = dt - datetime.now(timezone.utc)
-        s    = int(diff.total_seconds())
-        if s <= 0:
-            return "Reset imminente"
-        d, rem = divmod(s, 86400)
-        h, rem = divmod(rem, 3600)
-        m       = rem // 60
-        if d:   return f"Reset tra {d}g {h}h"
-        if h:   return f"Reset tra {h}h {m:02d}m"
-        return f"Reset tra {m}m"
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return int((dt - datetime.now(timezone.utc)).total_seconds())
     except Exception:
+        return None
+
+
+def fmt_reset(iso_str: str) -> str:
+    s = reset_seconds(iso_str)
+    if s is None:
         return ""
+    if s <= 0:
+        return "Reset imminente"
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m       = rem // 60
+    if d:   return f"Reset tra {d}g {h}h"
+    if h:   return f"Reset tra {h}h {m:02d}m"
+    return f"Reset tra {m}m"
+
+
+def reset_color(pct: float, secs, window_sec) -> str:
+    """
+    Colore del sub-label "Reset tra…". Scala volutamente SENZA rosso: il rosso
+    resta esclusivo del consumo (barra e percentuale), altrimenti la stessa riga
+    darebbe segnali opposti — una finestra appena resettata è lo stato più sano
+    possibile ma è anche quello più lontano dal reset.
+    Sotto ALERT_PCT il tempo al reset è informazione inerte → neutro. Sopra,
+    giallo finché c'è da resistere, verde nell'ultimo 20% della finestra.
+    """
+    if pct < ALERT_PCT or secs is None or not window_sec:
+        return C["sub"]
+    return C["green"] if secs <= window_sec * 0.20 else C["yellow"]
+
+
+def usage_sub_color(pct: float) -> str:
+    """
+    Colore dei sub-label che riportano un consumo (Contesto: token, Crediti: €).
+    Qui il testo *è* il consumo, quindi il colore della barra è coerente e il
+    rosso non contraddice nulla. Neutro sotto soglia, per non urlare a vuoto.
+    """
+    return bar_color(pct) if pct >= ALERT_PCT else C["sub"]
 
 
 def fmt_money(amount_minor, currency="EUR", exponent=2) -> str:
@@ -600,7 +645,7 @@ class UsageWidget:
         canvas.pack(fill=tk.X, pady=(2, 1))
         reset_lbl = tk.Label(frame, text="",
                               font=("Segoe UI", 7),
-                              bg=C["bg"], fg=C["gray"])
+                              bg=C["bg"], fg=C["sub"])
         reset_lbl.pack(anchor=tk.W)
         return frame, canvas, pct_lbl, reset_lbl, title_lbl
 
@@ -616,7 +661,11 @@ class UsageWidget:
             canvas.delete("all")
             fw = int(w * min(pct, 100) / 100)
             canvas.create_rectangle(0, 0, fw, 5, fill=color, outline="")
-        reset_lbl.config(text=fmt_reset(resets_at))
+        # Contesto e Crediti passano resets_at="" e riscrivono testo e fg dopo:
+        # qui restano neutri, il loro colore lo decide usage_sub_color().
+        secs = reset_seconds(resets_at)
+        reset_lbl.config(text=fmt_reset(resets_at),
+                         fg=reset_color(pct, secs, WINDOW_SEC.get(key)))
 
     # ── modalità compatta ───────────────────────────────────────────────────────
 
@@ -683,7 +732,8 @@ class UsageWidget:
                 self._draw_bar("credits", pct, "")
                 cred_rl.config(
                     text=f"{fmt_money(eu.get('used_credits'), cur, dp)} / "
-                         f"{fmt_money(eu.get('monthly_limit'), cur, dp)}")
+                         f"{fmt_money(eu.get('monthly_limit'), cur, dp)}",
+                    fg=usage_sub_color(pct))
                 self._values["credits"] = (pct, True)
             else:
                 cred_f.pack_forget()
@@ -733,7 +783,8 @@ class UsageWidget:
             self._draw_bar("context", ctx["pct"], "")
             bar_rl.config(
                 text=f"{ctx['tokens_used']:,} / {ctx['tokens_max']:,} tk"
-                     f"  ·  {ctx['age_min']}m fa")
+                     f"  ·  {ctx['age_min']}m fa",
+                fg=usage_sub_color(ctx["pct"]))
             self._values["context"] = (ctx["pct"], True)
         else:
             bar_f.pack_forget()
