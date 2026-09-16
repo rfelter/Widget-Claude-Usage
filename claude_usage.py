@@ -9,7 +9,7 @@ AUTH — supporta DUE metodi, scegli quello che preferisci:
   Metodo A – sessionKey (raccomandato, zero installazioni)
     1. Apri Edge/Chrome e vai su claude.ai (già loggato)
     2. Premi F12 → Application → Storage → Cookies → https://claude.ai
-    3. Copia il valore di  sessionKey  (inizia con sk-ant-sid01-...)
+    3. Copia il valore di  sessionKey  (inizia con sk-ant-sid...)
     4. Incollalo nel campo "sessionKey" del dialog di setup
 
   Metodo B – OAuth token (se hai già eseguito claude login)
@@ -93,8 +93,10 @@ CTX_MAX_TOKENS  = 200_000
 # Versione del widget. 1.0 = versione pre-compatta (mai numerata esplicitamente),
 # 1.1 = modalità compatta, 1.2 = hardening (thread unico, logging, fix minori),
 # 1.3 = barra Crediti di utilizzo (extra_usage),
-# 1.4 = sub-label sotto le barre leggibili e a colore contestuale.
-APP_VERSION = "1.4"
+# 1.4 = sub-label sotto le barre leggibili e a colore contestuale,
+# 1.5 = scelta dell'organizzazione per capability, campi credenziali
+#       cancellabili dal dialog, prefisso sessionKey aggiornato.
+APP_VERSION = "1.5"
 
 # ── Tema ──────────────────────────────────────────────────────────────────────
 C = dict(
@@ -141,7 +143,7 @@ def load_credentials() -> dict:
     """
     Restituisce un dict con le chiavi trovate:
       - 'oauth'   : token Bearer  (sk-ant-oat01-...)
-      - 'session' : session key   (sk-ant-sid01-...)
+      - 'session' : session key   (sk-ant-sid...)
     """
     result = {}
 
@@ -191,6 +193,36 @@ def _fetch_with_oauth(token: str) -> dict:
     return r.json()
 
 
+# Capability che identificano l'organizzazione "chat" di claude.ai: è quella che
+# espone /usage. Le org di solo API (capabilities ['api']) rispondono 403.
+CHAT_CAPS = ("chat", "claude_pro", "claude_max", "claude_team", "claude_enterprise")
+
+
+def _sort_orgs(body) -> list:
+    """
+    Normalizza la risposta di /api/organizations e mette davanti le org con
+    capability di chat. Difensivo sulla shape: scarta le voci senza uuid e
+    tollera capabilities assente o non-lista.
+    """
+    if isinstance(body, list):
+        orgs = body
+    elif isinstance(body, dict):
+        orgs = body.get("organizations", [body])
+    else:
+        return []  # shape imprevista (es. stringa): nessuna org utilizzabile
+    if not isinstance(orgs, list):
+        return []
+    orgs = [o for o in orgs if isinstance(o, dict) and o.get("uuid")]
+
+    def rango(o):
+        caps = o.get("capabilities")
+        if not isinstance(caps, list):
+            caps = []
+        return 0 if any(c in CHAT_CAPS for c in caps) else 1
+
+    return sorted(orgs, key=rango)
+
+
 def _fetch_with_session(session_key: str) -> dict:
     """
     Usa il sessionKey cookie per chiamare le API interne di claude.ai.
@@ -208,27 +240,32 @@ def _fetch_with_session(session_key: str) -> dict:
         "sec-fetch-site":   "same-origin",
     }
 
-    # Passo 1: ottieni l'org UUID
+    # Passo 1: elenco delle organizzazioni
     r = _http.get(ORGS_URL, cookies=cookies, headers=headers, timeout=12)
     if r.status_code == 401:
         raise RuntimeError("sessionKey non valido o scaduto (401) — ricopialo da Edge")
     r.raise_for_status()
 
-    body = r.json()
-    orgs = body if isinstance(body, list) else body.get("organizations", [body])
+    orgs = _sort_orgs(r.json())
     if not orgs:
         raise RuntimeError("Nessuna organizzazione trovata")
-    org_uuid = orgs[0].get("uuid") if isinstance(orgs[0], dict) else None
-    if not org_uuid:
-        raise RuntimeError("Risposta organizations inattesa (manca uuid)")
 
-    # Passo 2: endpoint corretto confermato da estensioni open-source
-    usage_url = f"https://claude.ai/api/organizations/{org_uuid}/usage"
-    r2 = _http.get(usage_url, cookies=cookies, headers=headers, timeout=12)
-    if r2.status_code == 404:
+    # Passo 2: prova le org in ordine di preferenza e tieni la prima che risponde.
+    # Non basta la prima della lista: un account può avere anche un'org di solo
+    # API, che su /usage risponde 403 (verificato), e l'ordine non è garantito.
+    ultimo = None
+    for org in orgs:
+        usage_url = f"https://claude.ai/api/organizations/{org['uuid']}/usage"
+        r2 = _http.get(usage_url, cookies=cookies, headers=headers, timeout=12)
+        if r2.status_code == 200:
+            return r2.json()
+        ultimo = r2
+
+    if ultimo is not None and ultimo.status_code == 404:
         raise RuntimeError("Endpoint /usage non trovato (404)")
-    r2.raise_for_status()
-    return r2.json()
+    raise RuntimeError(
+        f"Nessuna organizzazione espone /usage (HTTP {ultimo.status_code})"
+        if ultimo is not None else "Nessuna organizzazione utilizzabile")
 
 
 def fetch_usage(creds: dict) -> dict:
@@ -909,7 +946,7 @@ class UsageWidget:
         steps_a = [
             "1. Apri Edge (o Chrome) → vai su  claude.ai",
             "2. Premi  F12  →  Application  →  Cookies  →  https://claude.ai",
-            "3. Copia il valore di  sessionKey  (inizia con sk-ant-sid01-...)",
+            "3. Copia il valore di  sessionKey  (inizia con sk-ant-sid...)",
         ]
         for s in steps_a:
             tk.Label(pad, text=s, bg=C["bg2"], fg="#ccc",
@@ -967,8 +1004,20 @@ class UsageWidget:
                     fg=C["red"])
                 return
             new_cfg = dict(cfg)
-            if sk: new_cfg["session_key"] = sk
-            if ot: new_cfg["oauth_token"] = ot
+            # Campo svuotato = cancellazione esplicita. Con il solo "if sk:" il
+            # valore precedente sopravviveva in new_cfg, rendendo i campi di fatto
+            # incancellabili dal dialog (unica via: editare il JSON a mano). Serve
+            # per togliere una credenziale sbagliata, p.es. la sessionKey finita
+            # per errore nel campo OAuth: resta valida, fallisce a ogni refresh e
+            # blocca il rilevamento del token di Claude Code.
+            if sk:
+                new_cfg["session_key"] = sk
+            else:
+                new_cfg.pop("session_key", None)
+            if ot:
+                new_cfg["oauth_token"] = ot
+            else:
+                new_cfg.pop("oauth_token", None)
             _save_cfg(new_cfg)
             self.creds = load_credentials()
             dlg.destroy()
