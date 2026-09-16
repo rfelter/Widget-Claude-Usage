@@ -1,6 +1,6 @@
 # ⬡ Claude Usage Widget — Windows
 
-> Documentazione relativa alla **versione 1.4** del widget.
+> Documentazione relativa alla **versione 1.5** del widget.
 
 Widget flottante always-on-top che mostra in tempo reale:
 
@@ -25,7 +25,10 @@ Non è necessario installare Node.js o utilizzare il terminale per autenticarsi.
 2. Premi **F12** sulla tastiera (o fai clic destro -> *Ispeziona*) per aprire gli Strumenti per sviluppatori.
 3. Vai alla scheda **Applicazione** (o **Application** / **Storage** / **Archiviazione** a seconda del browser).
 4. Nel menu laterale, espandi la voce **Cookie** e seleziona `https://claude.ai`.
-5. Cerca la riga con nome **`sessionKey`** e copia il suo valore (è una stringa che inizia con `sk-ant-sid01-...`).
+5. Cerca la riga con nome **`sessionKey`** e copia il suo valore (è una stringa che inizia con `sk-ant-sid...`).
+
+   > Il prefisso è cambiato nel tempo: le chiavi erano `sk-ant-sid01-...`, oggi sono `sk-ant-sid02-...`.
+   > Conta il nome del cookie (`sessionKey`), non il numero nel prefisso.
 
 *Nota alternativa (opzionale): Se hai già installato la CLI Claude Code tramite Node.js, il widget rileverà automaticamente il tuo token OAuth presente in `~/.claude/.credentials.json`.*
 
@@ -102,6 +105,20 @@ La `sessionKey` può scadere se effettui il logout dal browser o dopo un certo p
 1. Accedi a [claude.ai](https://claude.ai) nel tuo browser.
 2. Copia la nuova `sessionKey` tramite F12.
 3. Apri le impostazioni del widget (click destro -> *Impostazioni* oppure icona **⚙**), incolla la nuova chiave e clicca su **Salva e aggiorna**.
+
+> ⚠ **Non incollare la `sessionKey` anche nel campo OAuth.** Sono due credenziali
+> diverse: il campo OAuth vuole un token `sk-ant-oat01-...`. Se ci finisce la
+> sessionKey, il widget tenta a ogni aggiornamento una chiamata destinata a
+> fallire prima di ripiegare sul metodo corretto — e impedisce il rilevamento
+> automatico del token di Claude Code. Lascialo vuoto se non usi il metodo B.
+> Per rimuoverne una già salvata basta **svuotare il campo e salvare** (dalla v1.5:
+> nelle versioni precedenti un campo lasciato vuoto veniva ignorato e il valore
+> vecchio restava nel file di configurazione).
+
+> **Più organizzazioni sullo stesso account?** Dalla v1.5 il widget sceglie da sé
+> quella con abbonamento chat (Pro/Max/Team): le organizzazioni di solo API non
+> espongono i dati di utilizzo e venivano scelte per errore se comparivano per
+> prime nella risposta.
 
 ---
 
