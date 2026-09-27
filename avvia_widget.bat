@@ -1,7 +1,8 @@
 @echo off
 :: Claude Usage Widget - Launcher per Windows
 :: Doppio clic per avviare. La console appare per un istante: e' intrinseco ai .bat.
-:: Per l'avvio SENZA alcuna finestra (es. avvio automatico) usare avvia_widget.vbs
+:: Per l'avvio SENZA alcuna finestra: esegui una volta crea_collegamento_silenzioso.ps1
+:: (tasto destro > Esegui con PowerShell) e usa il collegamento .lnk che genera.
 
 title Claude Usage Widget
 

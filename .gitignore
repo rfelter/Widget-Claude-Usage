@@ -1,0 +1,8 @@
+# Cache di Python, rigenerata a ogni avvio
+__pycache__/
+*.pyc
+
+# Collegamento generato da crea_collegamento_silenzioso.ps1: contiene il percorso
+# assoluto di pythonw.exe della macchina su cui viene creato, quindi è personale
+# e non va condiviso. Ognuno se lo rigenera con lo script.
+Avvia Widget (silenzioso).lnk
