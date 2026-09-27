@@ -1,12 +1,13 @@
 # ⬡ Claude Usage Widget — Windows
 
-> Documentazione relativa alla **versione 1.5** del widget.
+> Documentazione relativa alla **versione 1.6** del widget.
 
 Widget flottante always-on-top che mostra in tempo reale:
 
-- **Contesto** — solo se in uso claude code (aggiornato ogni minuto)
+- **Contesto** — solo se in uso claude code (aggiornato ogni minuto): token usati sulla finestra del modello in uso (1M per la generazione corrente, 200K per Haiku 4.5 e la famiglia 3.x)
 - **Sessione 5h** — % usata + countdown al reset (aggiornato ogni 5 minuti)
 - **Settimana** — % usata + countdown al reset  (aggiornato ogni 5 minuti)
+- **Sonnet** — quota settimanale dedicata a Sonnet (solo se il piano la prevede)
 - **Crediti** — crediti di utilizzo extra: % usata + valore usato/tetto in valuta (solo se attivi sul piano)
 
 Stessi dati di `Impostazioni → Utilizzo` in Claude Desktop.
@@ -30,7 +31,11 @@ Non è necessario installare Node.js o utilizzare il terminale per autenticarsi.
    > Il prefisso è cambiato nel tempo: le chiavi erano `sk-ant-sid01-...`, oggi sono `sk-ant-sid02-...`.
    > Conta il nome del cookie (`sessionKey`), non il numero nel prefisso.
 
-*Nota alternativa (opzionale): Se hai già installato la CLI Claude Code tramite Node.js, il widget rileverà automaticamente il tuo token OAuth presente in `~/.claude/.credentials.json`.*
+> **Nota sul Metodo B (OAuth).** Il widget cerca un token OAuth in `~/.claude/.credentials.json`,
+> il file che la CLI Claude Code usava per le credenziali. **Sulle installazioni aggiornate di
+> Claude Code quel file non viene più mantenuto**, quindi il rilevamento automatico in genere non
+> scatta: la via affidabile è la `sessionKey` del Passo 2. Se vuoi comunque un secondo canale,
+> `claude setup-token` genera un token a vita lunga da incollare a mano nel campo OAuth.
 
 ### Passo 3 — Avvia e configura il widget
 1. Fai doppio clic su **`avvia_widget.bat`** (oppure avvialo da terminale con `python claude_usage.py`).
@@ -49,6 +54,7 @@ Non è necessario installare Node.js o utilizzare il terminale per autenticarsi.
 | **⚙** (in alto a destra) | Apre la finestra delle impostazioni / inserimento chiave |
 | **⧉** (in alto a destra) | Riduce il widget alla **barra compatta** |
 | **⛶** (nella barra compatta) | Riespande il widget alla vista completa |
+| **!** rosso (in alto) | Compare quando esiste una versione più recente: clic per aprire la pagina dei rilasci |
 
 Il widget si aggiorna automaticamente con tempistiche diverse a seconda della barra.
 
@@ -58,7 +64,7 @@ Cliccando l'icona **⧉** il widget si riduce a una barra verticale stretta che 
 **solo le percentuali**, colorate secondo le stesse soglie (verde/giallo/rosso). Le voci
 restano nello stesso ordine verticale della vista completa, così sono riconoscibili anche
 senza etichetta; passando il mouse su una percentuale compare un **tooltip** con la
-descrizione (Contesto / Sessione 5h / Settimana / Sonnet). Il bordo destro resta ancorato,
+descrizione (Contesto / Sessione 5h / Settimana / Sonnet / Crediti). Il bordo destro resta ancorato,
 quindi il widget non si sposta orizzontalmente durante la riduzione.
 
 L'icona **⛶** nella barra compatta riporta alla vista completa. Lo **stato scelto
@@ -88,7 +94,7 @@ niente da segnalare. Superata la soglia si accende, con due logiche diverse:
 
 | Riga | Da 65% in su |
 |------|--------------|
-| **Reset tra…** (Sessione, Settimana, Sonnet) | 🟡 finché manca più del 20% della finestra al reset · 🟢 quando il reset è vicino |
+| **Reset tra…** (Sessione, Settimana, Sonnet) | 🟡 finché c'è da resistere · 🟢 quando il reset è vicino: entro **1 ora** per la Sessione 5h, entro **24 ore** per Settimana e Sonnet |
 | **Contesto** e **Crediti** | stesso colore della barra (🟡 → 🔴) |
 
 Il **rosso non compare mai sul countdown di reset**: è riservato al consumo
@@ -122,9 +128,33 @@ La `sessionKey` può scadere se effettui il logout dal browser o dopo un certo p
 
 ---
 
+## Avviso di nuova versione
+
+Quando esiste una release più recente di quella installata, nell'angolo in alto del widget
+compare un **`!` rosso**: un clic apre la pagina dei rilasci su GitHub. L'avviso compare anche
+nella barra compatta, e il passaggio del mouse mostra quale versione è disponibile.
+
+Come funziona, in concreto:
+
+- il controllo avviene **una volta al giorno**, in background, leggendo il numero dell'ultima
+  release pubblicata su GitHub. L'esito viene memorizzato, quindi riavviare il widget non
+  ripete la chiamata;
+- se la rete non c'è o GitHub non risponde, **non accade nulla**: nessun errore a schermo,
+  nessuna riga di log, nessun effetto sulle barre dell'utilizzo. Si riprova al prossimo avvio;
+- si disattiva togliendo la spunta a **«Avvisami se esce una nuova versione»** nelle
+  impostazioni. Disattivandolo il widget scorda anche l'ultimo esito, quindi il `!` sparisce.
+
+> ⚠ **L'avviso funziona solo dalla versione 1.6 in poi.** Chi usa una versione precedente non
+> può riceverlo: quel codice non contiene il controllo. Per essere avvisato senza aggiornare,
+> l'alternativa è **Watch → Custom → Releases** sulla pagina del repository, che manda una
+> notifica a ogni rilascio.
+
+---
+
 ## Privacy
 
-- Il widget comunica **solo** con i server ufficiali di Anthropic (`api.anthropic.com` e `claude.ai`).
+- Il widget comunica con i server ufficiali di Anthropic (`api.anthropic.com` e `claude.ai`) per i dati di utilizzo, e — **se il controllo aggiornamenti è attivo** — con `api.github.com` una volta al giorno per leggere il numero dell'ultima versione pubblicata. Nessun altro destinatario.
+- Nella chiamata a GitHub **non viene inviata nessuna credenziale**: è una richiesta pubblica e anonima, in cui GitHub vede solo il tuo indirizzo IP e la stringa `claude-usage-widget/<versione>`. Si disattiva dalla casella nelle impostazioni.
 - Le credenziali e la `sessionKey` sono salvate localmente sul tuo PC nel file di configurazione `~/.claude_usage_widget.json` (nella cartella del tuo profilo utente) e non vengono mai condivise o inviate altrove.
 - ⚠ **I token sono salvati in chiaro** in quel file, protetto solo dai permessi del tuo profilo utente Windows: non sincronizzarlo su cloud o backup condivisi e non condividerlo. La `sessionKey` equivale alla tua sessione claude.ai completa.
 - Eventuali errori vengono registrati in `~/.claude_usage_widget.log` (solo messaggi tecnici, mai token).

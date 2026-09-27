@@ -83,20 +83,30 @@ OAUTH_URL    = "https://api.anthropic.com/api/oauth/usage"
 BETA_HEADER  = "oauth-2025-04-20"
 ORGS_URL     = "https://claude.ai/api/organizations"
 
+# Controllo aggiornamenti. /releases/latest esclude gia' draft e prerelease,
+# quindi vede solo i rilasci veri. Disattivabile dalle impostazioni.
+GH_LATEST_API = "https://api.github.com/repos/rfelter/Widget-Claude-Usage/releases/latest"
+GH_RELEASES   = "https://github.com/rfelter/Widget-Claude-Usage/releases/latest"
+UPDATE_CHECK_SEC = 86_400  # una volta al giorno: le release sono rare
+
 CREDS_FILE   = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
 CFG_FILE     = os.path.join(os.path.expanduser("~"), ".claude_usage_widget.json")
 REFRESH_SEC     = 300
 CTX_REFRESH_SEC = 60
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
-CTX_MAX_TOKENS  = 200_000
+CTX_MAX_TOKENS  = 200_000    # finestra dei modelli 200K (Haiku 4.5, famiglia 3.x)
+CTX_MAX_1M      = 1_000_000  # finestra della generazione corrente
 
 # Versione del widget. 1.0 = versione pre-compatta (mai numerata esplicitamente),
 # 1.1 = modalità compatta, 1.2 = hardening (thread unico, logging, fix minori),
 # 1.3 = barra Crediti di utilizzo (extra_usage),
 # 1.4 = sub-label sotto le barre leggibili e a colore contestuale,
 # 1.5 = scelta dell'organizzazione per capability, campi credenziali
-#       cancellabili dal dialog, prefisso sessionKey aggiornato.
-APP_VERSION = "1.5"
+#       cancellabili dal dialog, prefisso sessionKey aggiornato,
+# 1.6 = finestra di contesto corretta (1M di default, non 200K), soglie
+#       assolute per il verde del countdown, footer e icone leggibili,
+#       correzioni di documentazione.
+APP_VERSION = "1.6"
 
 # ── Tema ──────────────────────────────────────────────────────────────────────
 C = dict(
@@ -104,9 +114,9 @@ C = dict(
     bg2     = "#191930",
     fg      = "#e2e2e2",
     accent  = "#e88c30",
-    gray    = "#555",
-    # Neutro dei sub-label sotto le barre: #555 rendeva 2,6:1 sul fondo (sotto
-    # ogni soglia WCAG), questo sta a ~6,8:1 restando un grigio di secondo piano.
+    # Neutro di tutto il testo secondario: sub-label sotto le barre, footer,
+    # icone, pallino di stato. Il vecchio #555 rendeva 2,59:1 sul fondo (sotto
+    # ogni soglia WCAG); questo sta a ~6,8:1 restando di secondo piano.
     sub     = "#9090a8",
     green   = "#22c55e",
     yellow  = "#f59e0b",
@@ -167,6 +177,53 @@ def load_credentials() -> dict:
             pass
 
     return result
+
+# ── Controllo aggiornamenti ───────────────────────────────────────────────────
+
+def parse_version(s):
+    """
+    'v1.10' → (1, 10, 0). None se non interpretabile.
+    Il padding a 3 elementi serve a non far sembrare '1.6.0' più recente di
+    '1.6'; le tuple di interi evitano il confronto alfabetico, per cui
+    '1.10' < '1.6' (con lo schema a decimali di questo progetto succederà).
+    """
+    m = re.fullmatch(r"v?(\d+(?:\.\d+){0,2})", (s or "").strip())
+    if not m:
+        return None
+    parti = [int(x) for x in m.group(1).split(".")]
+    return tuple(parti + [0] * (3 - len(parti)))
+
+
+def fetch_latest_version():
+    """
+    Tag dell'ultima release pubblicata (es. 'v1.7'), o None.
+    Fallisce SEMPRE in silenzio e non logga a livello WARNING: rete assente,
+    GitHub giù, rate limit o cambio di shape non devono toccare le barre
+    dell'utilizzo, che sono la ragione d'essere del widget.
+    Usa requests.get e NON la Session condivisa con le chiamate Anthropic:
+    nessuna possibilità che un cookie di claude.ai finisca verso GitHub.
+    """
+    try:
+        r = requests.get(
+            GH_LATEST_API, timeout=8,
+            headers={"Accept":     "application/vnd.github+json",
+                     "User-Agent": f"claude-usage-widget/{APP_VERSION}"})
+        if r.status_code != 200:
+            log.info("Controllo aggiornamenti: HTTP %s", r.status_code)
+            return None
+        body = r.json()
+        tag = body.get("tag_name") if isinstance(body, dict) else None
+        return tag if isinstance(tag, str) and tag else None
+    except Exception as e:
+        log.info("Controllo aggiornamenti non riuscito: %s", e)
+        return None
+
+
+def update_available(corrente: str, remoto: str) -> bool:
+    """True solo se entrambe le versioni sono leggibili e la remota è maggiore."""
+    a, b = parse_version(corrente), parse_version(remoto)
+    return bool(a and b and b > a)
+
 
 # ── Fetch ─────────────────────────────────────────────────────────────────────
 
@@ -304,9 +361,28 @@ def _read_tail_lines(path: Path, max_bytes: int = 262_144) -> list[str]:
     return lines
 
 
+# Modelli noti a 200K, riconosciuti per sottostringa dell'ID. Tutto il resto è
+# considerato a 1M: l'intera generazione corrente (Opus 4.6+, Sonnet 4.6+,
+# Fable 5.x, Opus 5.x) ha finestra da 1M, quindi il default giusto è quello.
+# Sbagliare in difetto è il caso peggiore — la barra si inchioda al 100% e
+# diventa inutile (era il bug: Opus 5 mostrato a 216.000/200.000); sbagliare in
+# eccesso sottostima la percentuale, fastidioso ma non accecante.
+CTX_200K_MODELS = ("haiku", "claude-3")
+
+
 def _ctx_max_for(model_id: str) -> int:
-    """Finestra contesto del modello: 1M per gli ID con suffisso [1m], 200K default."""
-    return 1_000_000 if "[1m]" in model_id else CTX_MAX_TOKENS
+    """
+    Finestra di contesto del modello. Default 1M, 200K solo per i modelli noti
+    come tali. Il vecchio criterio (1M solo col suffisso "[1m]" nell'ID) non
+    corrisponde più agli ID emessi: nessuno lo riporta, quindi ogni modello
+    finiva a 200K. Il controllo su "[1m]" resta per compatibilità.
+    """
+    mid = (model_id or "").lower()
+    if "[1m]" in mid:
+        return CTX_MAX_1M
+    if any(k in mid for k in CTX_200K_MODELS):
+        return CTX_MAX_TOKENS
+    return CTX_MAX_1M
 
 
 def fetch_context_window() -> dict | None:
@@ -380,12 +456,14 @@ def bar_color(pct: float) -> str:
 # Soglia di utilizzo oltre la quale i sub-label smettono di essere neutri.
 # Coincide con la soglia gialla della barra: la riga si accende tutta insieme.
 ALERT_PCT = 65
-# Durata nominale della finestra di ogni bucket, per normalizzare il tempo
-# residuo al reset ("2h" significa cose opposte su 5h e su 7 giorni).
-WINDOW_SEC = {
-    "five_hour":        5 * 3600,
-    "seven_day":        7 * 86400,
-    "seven_day_sonnet": 7 * 86400,
+# Entro quanto manca al reset perché sia considerato "vicino" e il countdown
+# passi al verde. Valori ASSOLUTI per barra, non una frazione della finestra:
+# "vicino" è una nozione umana, e una frazione fissa la tradisce — il 20% di
+# sette giorni sono 33 ore, che non sono vicine in nessun senso pratico.
+RESET_SOON_SEC = {
+    "five_hour":        1 * 3600,   # ultima ora
+    "seven_day":        24 * 3600,  # ultime 24 ore
+    "seven_day_sonnet": 24 * 3600,
 }
 
 
@@ -414,18 +492,18 @@ def fmt_reset(iso_str: str) -> str:
     return f"Reset tra {m}m"
 
 
-def reset_color(pct: float, secs, window_sec) -> str:
+def reset_color(pct: float, secs, soon_sec) -> str:
     """
     Colore del sub-label "Reset tra…". Scala volutamente SENZA rosso: il rosso
     resta esclusivo del consumo (barra e percentuale), altrimenti la stessa riga
     darebbe segnali opposti — una finestra appena resettata è lo stato più sano
     possibile ma è anche quello più lontano dal reset.
     Sotto ALERT_PCT il tempo al reset è informazione inerte → neutro. Sopra,
-    giallo finché c'è da resistere, verde nell'ultimo 20% della finestra.
+    giallo finché c'è da resistere, verde quando il reset è vicino (soon_sec).
     """
-    if pct < ALERT_PCT or secs is None or not window_sec:
+    if pct < ALERT_PCT or secs is None or not soon_sec:
         return C["sub"]
-    return C["green"] if secs <= window_sec * 0.20 else C["yellow"]
+    return C["green"] if secs <= soon_sec else C["yellow"]
 
 
 def usage_sub_color(pct: float) -> str:
@@ -517,6 +595,7 @@ class UsageWidget:
         self._values       = {}   # key -> (pct, visible)
         self._wake         = threading.Event()  # sveglia il refresh loop
         self._loop_started = False               # un solo thread di refresh
+        self._new_version  = None                # tag della release piu' recente
         # Angolo di ancoraggio tracciato manualmente (coord. schermo del bordo destro/
         # inferiore). Evita di leggere winfo_x/width al toggle, che su alcuni sistemi
         # (DPI/overrideredirect) arrivano sfasati di un ciclo → posizione oscillante.
@@ -595,17 +674,24 @@ class UsageWidget:
                  font=("Segoe UI", 10, "bold"),
                  bg=C["bg"], fg=C["accent"]).pack(side=tk.LEFT)
         self._dot = tk.Label(hdr, text="●", font=("Segoe UI", 10),
-                              bg=C["bg"], fg=C["gray"])
+                              bg=C["bg"], fg=C["sub"])
         self._dot.pack(side=tk.RIGHT)
         gear = tk.Label(hdr, text="⚙", font=("Segoe UI", 10),
-                        bg=C["bg"], fg=C["gray"], cursor="hand2")
+                        bg=C["bg"], fg=C["sub"], cursor="hand2")
         gear.pack(side=tk.RIGHT, padx=(0, 6))
         gear.bind("<Button-1>", lambda _: self._show_setup())
         collapse = tk.Label(hdr, text="⧉", font=("Segoe UI", 10),
-                            bg=C["bg"], fg=C["gray"], cursor="hand2")
+                            bg=C["bg"], fg=C["sub"], cursor="hand2")
         collapse.pack(side=tk.RIGHT, padx=(0, 6))
         collapse.bind("<Button-1>", lambda _: self._toggle_compact())
         Tooltip(collapse, "Riduci")
+
+        # Avviso nuova versione: creato nascosto, mostrato solo se ce n'e' una.
+        # pack(before=) sul pallino lo tiene a sinistra delle altre icone.
+        self._upd_lbl = tk.Label(hdr, text="!", font=("Segoe UI", 11, "bold"),
+                                 bg=C["bg"], fg=C["red"], cursor="hand2")
+        self._upd_tip = Tooltip(self._upd_lbl, "")
+        self._upd_lbl.bind("<Button-1>", lambda _: webbrowser.open(GH_RELEASES))
 
         self._bar_frame = tk.Frame(outer, bg=C["bg"])
         self._bar_frame.pack(fill=tk.BOTH, expand=True)
@@ -638,14 +724,14 @@ class UsageWidget:
         footer_frame.pack(fill=tk.X)
         self._status_lbl = tk.Label(footer_frame, text="",
                                     font=("Segoe UI", 7),
-                                    bg=C["bg"], fg=C["gray"])
+                                    bg=C["bg"], fg=C["sub"])
         self._status_lbl.pack(side=tk.LEFT)
         link = tk.Label(footer_frame, text="Felter Roberto",
                         font=("Segoe UI", 7), bg=C["bg"],
                         fg=C["accent"], cursor="hand2")
         link.pack(side=tk.RIGHT)
         tk.Label(footer_frame, text="by ",
-                 font=("Segoe UI", 7), bg=C["bg"], fg=C["gray"]
+                 font=("Segoe UI", 7), bg=C["bg"], fg=C["sub"]
                  ).pack(side=tk.RIGHT)
         link.bind("<Button-1>",
                   lambda _: webbrowser.open("https://www.felter.it"))
@@ -654,10 +740,15 @@ class UsageWidget:
         # Figlio di root (non di outer) con padding proprio → margini 5px indipendenti.
         self._compact_frame = tk.Frame(self.root, bg=C["bg"], padx=5, pady=8)
         expand = tk.Label(self._compact_frame, text="⛶", font=("Segoe UI", 10),
-                          bg=C["bg"], fg=C["gray"], cursor="hand2")
+                          bg=C["bg"], fg=C["sub"], cursor="hand2")
         expand.pack(pady=(0, 4))  # centrato orizzontalmente
         expand.bind("<Button-1>", lambda _: self._toggle_compact())
         Tooltip(expand, "Espandi")
+        self._upd_lbl_c = tk.Label(self._compact_frame, text="!",
+                                   font=("Segoe UI", 11, "bold"),
+                                   bg=C["bg"], fg=C["red"], cursor="hand2")
+        self._upd_tip_c = Tooltip(self._upd_lbl_c, "")
+        self._upd_lbl_c.bind("<Button-1>", lambda _: webbrowser.open(GH_RELEASES))
         for key in self._KEYS:
             lbl = tk.Label(self._compact_frame, text="–%",
                            font=("Segoe UI", 10, "bold"),
@@ -702,7 +793,7 @@ class UsageWidget:
         # qui restano neutri, il loro colore lo decide usage_sub_color().
         secs = reset_seconds(resets_at)
         reset_lbl.config(text=fmt_reset(resets_at),
-                         fg=reset_color(pct, secs, WINDOW_SEC.get(key)))
+                         fg=reset_color(pct, secs, RESET_SOON_SEC.get(key)))
 
     # ── modalità compatta ───────────────────────────────────────────────────────
 
@@ -868,6 +959,70 @@ class UsageWidget:
         else:
             self._start_refresh_loop()
         self._refresh_context()  # avvia loop autonomo context window (ogni 60s)
+        self._check_update()
+
+    # ── controllo aggiornamenti ───────────────────────────────────────────────
+
+    def _show_update_badge(self):
+        """Mostra o nasconde il "!" in entrambe le viste, secondo _new_version."""
+        # lstrip("v"): il tag è "v1.9", ma "versione v1.9" si legge male.
+        testo = (f"Disponibile la versione {self._new_version.lstrip('v')}"
+                 f" — clic per scaricarla" if self._new_version else "")
+        for lbl, tip, opts in ((self._upd_lbl,   self._upd_tip,   {"side": tk.RIGHT,
+                                                                   "padx": (0, 6)}),
+                               (self._upd_lbl_c, self._upd_tip_c, {"pady": (0, 4)})):
+            tip.text = testo
+            if self._new_version:
+                if not lbl.winfo_manager():
+                    lbl.pack(**opts)
+            else:
+                lbl.pack_forget()
+        self._position_window()
+
+    def _check_update(self):
+        """
+        Controlla su GitHub se esiste una release più recente, al massimo una
+        volta ogni UPDATE_CHECK_SEC. L'esito è memorizzato in configurazione, così
+        un riavvio non rifà la chiamata. Tutto in un thread: la rete non deve
+        mai bloccare la UI. Disattivabile con "check_updates": false.
+        """
+        cfg = _load_cfg()
+        if not cfg.get("check_updates", True):
+            self._new_version = None
+            self.root.after(0, self._show_update_badge)
+            return
+
+        scaduto = (time.time() - float(cfg.get("last_update_check") or 0)
+                   > UPDATE_CHECK_SEC)
+        if not scaduto:
+            # Riusa l'ultimo tag visto senza richiamare GitHub.
+            visto = cfg.get("latest_seen_version")
+            self._new_version = visto if update_available(APP_VERSION, visto) else None
+            self.root.after(0, self._show_update_badge)
+            return
+
+        def worker():
+            tag = fetch_latest_version()
+            if tag:
+                # Solo in caso di successo aggiorniamo il timestamp: se GitHub è
+                # irraggiungibile vogliamo riprovare al prossimo avvio, non
+                # aspettare 24h a vuoto.
+                nuovo = dict(_load_cfg())
+                nuovo["last_update_check"]   = int(time.time())
+                nuovo["latest_seen_version"] = tag
+                try:
+                    _save_cfg(nuovo)
+                except Exception:
+                    log.info("Salvataggio esito controllo aggiornamenti non riuscito")
+            self._new_version = tag if update_available(APP_VERSION, tag) else None
+            # Il controllo parte all'avvio e può durare fino al timeout: se
+            # nel frattempo la finestra è stata chiusa, after() solleva.
+            try:
+                self.root.after(0, self._show_update_badge)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ── drag ──────────────────────────────────────────────────────────────────
 
@@ -926,7 +1081,7 @@ class UsageWidget:
         dlg = tk.Toplevel(self.root)
         dlg.title("Impostazioni – Claude Usage Widget")
         dlg.configure(bg=C["bg"])
-        dlg.geometry("420x500")
+        dlg.geometry("420x540")
         dlg.attributes("-topmost", True)
         dlg.resizable(False, False)
         dlg.grab_set()
@@ -963,7 +1118,7 @@ class UsageWidget:
                            insertbackground=C["fg"],
                            relief=tk.FLAT, bd=0)
             ent.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
-            eye = tk.Label(row, text="👁", bg=C["bg2"], fg=C["gray"],
+            eye = tk.Label(row, text="👁", bg=C["bg2"], fg=C["sub"],
                            font=("Segoe UI", 9), cursor="hand2", padx=6)
             eye.pack(side=tk.RIGHT)
             eye.bind("<Button-1>",
@@ -989,6 +1144,23 @@ class UsageWidget:
                  font=("Segoe UI", 8)).pack(anchor="w", pady=(4, 0))
         ot_var = tk.StringVar(value=cfg.get("oauth_token", ""))
         secret_entry(ot_var).pack(fill=tk.X, pady=(2, 0))
+
+        # Stesso separatore usato tra Metodo A e Metodo B: il controllo
+        # aggiornamenti è una sezione a sé, non una coda del Metodo B.
+        sep2 = tk.Frame(pad, height=1, bg="#333")
+        sep2.pack(fill=tk.X, pady=10)
+
+        # ── Aggiornamenti ─────────────────────────────────────────────────────
+        # È l'unica chiamata di rete verso un server non Anthropic, quindi deve
+        # essere visibile e disattivabile, non nascosta.
+        upd_var = tk.BooleanVar(value=bool(cfg.get("check_updates", True)))
+        tk.Checkbutton(
+            pad, variable=upd_var,
+            text="Avvisami se esce una nuova versione (un controllo al giorno su GitHub)",
+            bg=C["bg"], fg="#aaa", selectcolor=C["bg2"],
+            activebackground=C["bg"], activeforeground="#ddd",
+            font=("Segoe UI", 8), anchor="w", bd=0, highlightthickness=0,
+            cursor="hand2").pack(anchor="w", fill=tk.X)
 
         msg_lbl = tk.Label(pad, text="",
                            bg=C["bg"], fg=C["red"],
@@ -1018,10 +1190,17 @@ class UsageWidget:
                 new_cfg["oauth_token"] = ot
             else:
                 new_cfg.pop("oauth_token", None)
+            # Se l'utente disattiva il controllo, scordiamo anche l'esito
+            # memorizzato: il "!" non deve sopravvivere alla disattivazione.
+            new_cfg["check_updates"] = bool(upd_var.get())
+            if not new_cfg["check_updates"]:
+                new_cfg.pop("latest_seen_version", None)
+                new_cfg.pop("last_update_check", None)
             _save_cfg(new_cfg)
             self.creds = load_credentials()
             dlg.destroy()
             self._start_refresh_loop()
+            self._check_update()   # applica subito la preferenza appena salvata
 
         tk.Button(pad, text="💾  Salva e aggiorna",
                   command=save_and_close,
@@ -1041,13 +1220,13 @@ class UsageWidget:
         foot = tk.Frame(pad, bg=C["bg"])
         foot.pack(side=tk.BOTTOM, fill=tk.X, pady=(12, 0))
         tk.Label(foot, text=f"v{APP_VERSION}",
-                 font=("Segoe UI", 7), bg=C["bg"], fg=C["gray"]).pack(side=tk.LEFT)
+                 font=("Segoe UI", 7), bg=C["bg"], fg=C["sub"]).pack(side=tk.LEFT)
         flink = tk.Label(foot, text="Felter Roberto",
                          font=("Segoe UI", 7), bg=C["bg"],
                          fg=C["accent"], cursor="hand2")
         flink.pack(side=tk.RIGHT)
         tk.Label(foot, text="by ",
-                 font=("Segoe UI", 7), bg=C["bg"], fg=C["gray"]).pack(side=tk.RIGHT)
+                 font=("Segoe UI", 7), bg=C["bg"], fg=C["sub"]).pack(side=tk.RIGHT)
         flink.bind("<Button-1>",
                    lambda _: webbrowser.open("https://www.felter.it"))
 
